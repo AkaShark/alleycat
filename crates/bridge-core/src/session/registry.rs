@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::session::{AgentId, AttachOutcome, NodeId, Session};
+use crate::session::{AgentId, AttachOutcome, NodeId, Session, SessionObserver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachKind {
@@ -65,18 +65,49 @@ impl Default for SessionRegistryConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct SessionRegistry {
     inner: Mutex<HashMap<(NodeId, AgentId), Arc<Session>>>,
     config: SessionRegistryConfig,
+    /// Installed on every session this registry mints.
+    observer: Option<Arc<dyn SessionObserver>>,
+}
+
+impl std::fmt::Debug for SessionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRegistry")
+            .field("inner", &self.inner)
+            .field("config", &self.config)
+            .field("observer", &self.observer.is_some())
+            .finish()
+    }
 }
 
 impl SessionRegistry {
     pub fn new(config: SessionRegistryConfig) -> Arc<Self> {
+        Self::with_observer(config, None)
+    }
+
+    /// Like [`SessionRegistry::new`], but every session created by this
+    /// registry carries `observer` (see [`SessionObserver`]).
+    pub fn with_observer(
+        config: SessionRegistryConfig,
+        observer: Option<Arc<dyn SessionObserver>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(HashMap::new()),
             config,
+            observer,
         })
+    }
+
+    fn mint(&self, node_id: NodeId, agent: AgentId) -> Arc<Session> {
+        Arc::new(Session::new_with_observer(
+            agent,
+            node_id,
+            self.config.ring_max_msgs,
+            self.config.ring_max_bytes,
+            self.observer.clone(),
+        ))
     }
 
     pub fn config(&self) -> &SessionRegistryConfig {
@@ -97,14 +128,7 @@ impl SessionRegistry {
         let mut inner = self.inner.lock().unwrap();
         inner
             .entry((node_id.clone(), agent))
-            .or_insert_with(|| {
-                Arc::new(Session::new(
-                    agent,
-                    node_id,
-                    self.config.ring_max_msgs,
-                    self.config.ring_max_bytes,
-                ))
-            })
+            .or_insert_with(|| self.mint(node_id, agent))
             .clone()
     }
 
@@ -126,12 +150,7 @@ impl SessionRegistry {
             if let Some(existing) = inner.get(&key) {
                 (existing.clone(), true)
             } else {
-                let fresh = Arc::new(Session::new(
-                    agent,
-                    node_id,
-                    self.config.ring_max_msgs,
-                    self.config.ring_max_bytes,
-                ));
+                let fresh = self.mint(node_id, agent);
                 inner.insert(key, fresh.clone());
                 (fresh, false)
             }
@@ -296,6 +315,54 @@ mod tests {
         session.enqueue(notif("a"));
         reg.tick(Duration::from_millis(0), Duration::from_millis(0));
         assert!(reg.get("node-abc", "pi").is_some());
+    }
+
+    #[derive(Default)]
+    struct CountingObserver {
+        methods: Mutex<Vec<String>>,
+    }
+
+    impl SessionObserver for CountingObserver {
+        fn on_enqueue(&self, _node_id: &str, _agent: AgentId, payload: &Value) {
+            if let Some(method) = payload.get("method").and_then(Value::as_str) {
+                self.methods.lock().unwrap().push(method.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn with_observer_installs_on_both_creation_paths() {
+        let observer = Arc::new(CountingObserver::default());
+        let reg = SessionRegistry::with_observer(
+            SessionRegistryConfig::default(),
+            Some(observer.clone() as Arc<dyn SessionObserver>),
+        );
+        let a = reg.get_or_create("node-a".into(), "pi");
+        let b = reg.resolve_attach("node-b".into(), "claude", None).session;
+        a.enqueue(notif("from-get-or-create"));
+        b.enqueue(notif("from-resolve-attach"));
+        assert_eq!(
+            *observer.methods.lock().unwrap(),
+            vec!["from-get-or-create", "from-resolve-attach"]
+        );
+    }
+
+    #[test]
+    fn observer_survives_registry_release() {
+        // Bridges cache Arc<Session> handles; an orphaned session (dropped
+        // from the registry by the reaper) must still be observed.
+        let observer = Arc::new(CountingObserver::default());
+        let reg = SessionRegistry::with_observer(
+            SessionRegistryConfig::default(),
+            Some(observer.clone() as Arc<dyn SessionObserver>),
+        );
+        let session = reg.get_or_create("node-a".into(), "claude");
+        let _h = session.install_attachment(None);
+        session.drop_attachment();
+        reg.tick(Duration::from_millis(0), Duration::from_millis(0));
+        assert!(reg.get("node-a", "claude").is_none());
+        session.enqueue(notif("turn/completed"));
+        assert_eq!(*observer.methods.lock().unwrap(), vec!["turn/completed"]);
     }
 
     #[test]

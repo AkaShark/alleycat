@@ -10,8 +10,8 @@ pub mod registry;
 pub mod ring;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -29,6 +29,22 @@ pub type AgentId = &'static str;
 /// Cryptographic node id for a paired client. Stored as a hex string so the
 /// session module is independent of `iroh` types.
 pub type NodeId = String;
+
+/// Passive tap on every outbound frame a [`Session`] enqueues.
+///
+/// Installed per `Session` instance (see [`Session::new_with_observer`] and
+/// [`SessionRegistry::with_observer`]) rather than looked up through the
+/// registry, because some bridges cache `Arc<Session>` handles that outlive
+/// their registry entry. The observer runs synchronously on the producer's
+/// hot path after the frame is in the replay ring and with no session lock
+/// held, so implementations must be cheap and must never block (hand work off
+/// to a channel instead).
+///
+/// Frames suppressed by the client's `optOutNotificationMethods` never reach
+/// `enqueue` and are therefore not observed.
+pub trait SessionObserver: Send + Sync {
+    fn on_enqueue(&self, node_id: &str, agent: AgentId, payload: &Value);
+}
 
 /// Outstanding server→client request that has been delivered but not yet
 /// answered. Distinct from [`PendingServerRequest`]: that one owns the
@@ -114,6 +130,8 @@ pub struct Session {
     /// so the most recent uncertain frame is re-sent — duplicates over
     /// missing data.
     last_attempted_seq: AtomicU64,
+    /// Optional passive tap called for every enqueued frame.
+    observer: Option<Arc<dyn SessionObserver>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -133,6 +151,18 @@ impl Session {
         ring_max_msgs: usize,
         ring_max_bytes: usize,
     ) -> Self {
+        Self::new_with_observer(agent, node_id, ring_max_msgs, ring_max_bytes, None)
+    }
+
+    /// Like [`Session::new`], with an optional [`SessionObserver`] that sees
+    /// every frame passed to [`Session::enqueue`].
+    pub fn new_with_observer(
+        agent: AgentId,
+        node_id: NodeId,
+        ring_max_msgs: usize,
+        ring_max_bytes: usize,
+        observer: Option<Arc<dyn SessionObserver>>,
+    ) -> Self {
         let session_short = format!("{:08x}", short_hash(&node_id, agent));
         Self {
             agent,
@@ -147,6 +177,7 @@ impl Session {
             attachment_generation: AtomicU64::new(0),
             detach: Mutex::new(DetachState { detached_at: None }),
             last_attempted_seq: AtomicU64::new(0),
+            observer,
         }
     }
 
@@ -172,6 +203,9 @@ impl Session {
     /// read it off the wire. Codex's JSON-RPC envelopes use serde without
     /// `deny_unknown_fields`, so existing litter-side parsers ignore it.
     /// Non-object payloads are passed through unstamped.
+    ///
+    /// If a [`SessionObserver`] is installed it is called after the frame is
+    /// in the ring and before live delivery, with no session lock held.
     pub fn enqueue(&self, mut payload: Value) -> u64 {
         let seq = {
             let mut ring = self.ring.lock().unwrap();
@@ -181,6 +215,9 @@ impl Session {
             debug_assert_eq!(assigned, next, "ring assigned a different seq than peeked");
             assigned
         };
+        if let Some(observer) = self.observer.as_ref() {
+            observer.on_enqueue(&self.node_id, self.agent, &payload);
+        }
         let attachment = self.attachment.lock().unwrap();
         if let Some(attachment) = attachment.as_ref() {
             // Best-effort: if the drainer is gone, the message is still in
@@ -536,6 +573,65 @@ mod tests {
             Ok(Err(ServerRequestError::ConnectionClosed)) => {}
             other => panic!("expected ConnectionClosed, got {other:?}"),
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: Mutex<Vec<(String, AgentId, Value)>>,
+    }
+
+    impl SessionObserver for RecordingObserver {
+        fn on_enqueue(&self, node_id: &str, agent: AgentId, payload: &Value) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((node_id.to_string(), agent, payload.clone()));
+        }
+    }
+
+    #[test]
+    fn observer_sees_every_enqueued_frame_with_identity() {
+        let observer = Arc::new(RecordingObserver::default());
+        let session = Session::new_with_observer(
+            "claude",
+            "node-abc".into(),
+            16,
+            1 << 20,
+            Some(observer.clone() as Arc<dyn SessionObserver>),
+        );
+        session.enqueue(notif("a"));
+        session.enqueue(notif("turn/completed"));
+        let seen = observer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0, "node-abc");
+        assert_eq!(seen[1].1, "claude");
+        assert_eq!(seen[1].2["method"], "turn/completed");
+        // The observed payload is the stamped one that went into the ring.
+        assert_eq!(seen[1].2["_alleycat_seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn observer_does_not_disturb_live_delivery() {
+        let observer = Arc::new(RecordingObserver::default());
+        let session = Session::new_with_observer(
+            "pi",
+            "node-abc".into(),
+            16,
+            1 << 20,
+            Some(observer.clone() as Arc<dyn SessionObserver>),
+        );
+        let mut handle = session.install_attachment(None);
+        session.enqueue(notif("a"));
+        let frame = handle.live_rx.recv().await.expect("live frame");
+        assert_eq!(frame.seq, 1);
+        assert_eq!(observer.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plain_new_has_no_observer() {
+        let session = Session::new("pi", "node-abc".into(), 16, 1 << 20);
+        assert!(session.observer.is_none());
+        session.enqueue(notif("a"));
     }
 
     #[test]
