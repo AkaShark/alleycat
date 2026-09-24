@@ -262,6 +262,28 @@ pub struct ThreadUnarchiveResponse {
     pub thread: Thread,
 }
 
+// === thread/unsubscribe ====================================================
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnsubscribeParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnsubscribeResponse {
+    pub status: ThreadUnsubscribeStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadUnsubscribeStatus {
+    NotLoaded,
+    NotSubscribed,
+    Unsubscribed,
+}
+
 // === thread/name/set =======================================================
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
