@@ -8,10 +8,12 @@ mod cli;
 mod config;
 mod daemon;
 mod framing;
+mod fsutil;
 mod host;
 mod ipc;
 mod paths;
 mod protocol;
+mod push;
 mod service;
 mod state;
 mod stream;
@@ -50,6 +52,13 @@ pub struct App {
     /// installed CLI can detect a stale long-running daemon and respawn
     /// itself transparently. Binaries should pass `env!("CARGO_PKG_VERSION")`.
     pub version: &'static str,
+    /// Default push Worker base URL for host-reported turn completion
+    /// notifications (e.g. `https://push.example.workers.dev`). `host.toml`
+    /// `[push] worker_url` overrides it. `None` (the alleycat default, see
+    /// [`App::DEFAULT`]) leaves push disabled unless the config sets a URL.
+    /// Wrappers that don't care can fill the remaining fields with
+    /// `..App::DEFAULT`.
+    pub push_worker_url: Option<&'static str>,
 }
 
 impl App {
@@ -63,6 +72,7 @@ impl App {
         application: "alleycat",
         label: "dev.alleycat.alleycat",
         version: env!("CARGO_PKG_VERSION"),
+        push_worker_url: None,
     };
 
     /// Build a tokio runtime, parse CLI args using `self.binary_name` as
@@ -134,6 +144,8 @@ enum Command {
     Restart,
     /// Inspect agents.
     Agents(cli::agents::AgentsArgs),
+    /// Inspect host-reported push notifications.
+    Push(cli::push::PushArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
     /// methods directly. Defaults to invoking `thread/list` on the chosen agent.
     Probe(cli::probe::ProbeArgs),
@@ -197,6 +209,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Agents(args)) => {
             init_cli_logging();
             cli::agents::run(args).await
+        }
+        Some(Command::Push(args)) => {
+            init_cli_logging();
+            cli::push::run(args).await
         }
         Some(Command::Probe(args)) => {
             init_cli_logging();

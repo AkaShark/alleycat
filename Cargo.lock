@@ -74,6 +74,7 @@ dependencies = [
  "alleycat-amp-bridge",
  "alleycat-bridge-core",
  "alleycat-claude-bridge",
+ "alleycat-codex-proto",
  "alleycat-devin-bridge",
  "alleycat-droid-bridge",
  "alleycat-grok-bridge",

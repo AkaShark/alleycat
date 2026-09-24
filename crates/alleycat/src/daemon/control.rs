@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{AgentInfo, PairPayload};
+use crate::push::PushStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -22,6 +23,9 @@ pub enum Request {
     Stop,
     /// Agent introspection.
     AgentsList,
+    /// Push notification state: enabled, Worker host, subscription count,
+    /// outbox depth, last success / error.
+    PushStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,10 @@ pub struct StatusInfo {
     /// for forwards compatibility with daemons that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Push notification state; absent on daemons without push support and
+    /// in offline (daemon not running) status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +113,36 @@ mod tests {
         let s = serde_json::to_string(&Request::Rotate).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::Rotate));
+    }
+
+    #[test]
+    fn push_status_request_uses_snake_case_op() {
+        let s = serde_json::to_string(&Request::PushStatus).unwrap();
+        assert_eq!(s, r#"{"op":"push_status"}"#);
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::PushStatus));
+    }
+
+    #[test]
+    fn status_info_push_field_is_optional() {
+        let old = r#"{"pid":1,"node_id":"n","token_short":"t","relay":null,"config_path":"c","uptime_secs":2,"agents":[]}"#;
+        let info: StatusInfo = serde_json::from_str(old).unwrap();
+        assert!(info.push.is_none());
+        let mut info = info;
+        info.push = Some(PushStatus {
+            enabled: true,
+            worker_host: Some("push.example".into()),
+            subscriptions: 2,
+            outbox_depth: 1,
+            last_success_at: Some(10),
+            last_error: None,
+            last_error_at: None,
+        });
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["push"]["enabled"], true);
+        assert_eq!(value["push"]["worker_host"], "push.example");
+        assert_eq!(value["push"]["outbox_depth"], 1);
+        assert!(value["push"].get("last_error").is_none());
     }
 
     #[test]

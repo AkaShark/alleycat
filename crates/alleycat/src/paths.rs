@@ -124,6 +124,23 @@ pub fn daemon_pid_file() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("daemon.pid"))
 }
 
+/// `<state_dir>/push-subscriptions.json` — push subscriptions registered by
+/// paired devices.
+pub fn push_subscriptions_file() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("push-subscriptions.json"))
+}
+
+/// `<state_dir>/push-outbox.json` — pending signed requests to the push Worker.
+pub fn push_outbox_file() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("push-outbox.json"))
+}
+
+/// `<state_dir>/push-recent-terminals.json` — recently observed turn terminal
+/// states (subscribe-after-finish race + stable event ids).
+pub fn push_recent_terminals_file() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("push-recent-terminals.json"))
+}
+
 /// `sockaddr_un.sun_path` size on Darwin/BSD (104) and Linux (108). Minus the
 /// trailing NUL the kernel needs.
 #[cfg(target_os = "linux")]
@@ -332,6 +349,26 @@ mod tests {
         let kf = host_key_file().unwrap();
         assert_eq!(kf.file_name().unwrap(), "host.key");
         assert!(kf.starts_with(state_dir().unwrap()));
+    }
+
+    #[test]
+    fn push_files_live_under_state_dir() {
+        let _h = TempHome::new();
+        let state = state_dir().unwrap();
+        for (path, name) in [
+            (
+                push_subscriptions_file().unwrap(),
+                "push-subscriptions.json",
+            ),
+            (push_outbox_file().unwrap(), "push-outbox.json"),
+            (
+                push_recent_terminals_file().unwrap(),
+                "push-recent-terminals.json",
+            ),
+        ] {
+            assert_eq!(path.file_name().unwrap(), name);
+            assert!(path.starts_with(&state));
+        }
     }
 
     #[cfg(unix)]

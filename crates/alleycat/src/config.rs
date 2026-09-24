@@ -1,11 +1,9 @@
-use std::path::{Path, PathBuf};
-
 use anyhow::Context;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
+use crate::fsutil::atomic_write;
 use crate::paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -15,6 +13,7 @@ pub struct HostConfig {
     pub relay: Option<String>,
     pub agents: AgentsConfig,
     pub session: SessionConfig,
+    pub push: PushConfig,
 }
 
 impl Default for HostConfig {
@@ -24,6 +23,33 @@ impl Default for HostConfig {
             relay: None,
             agents: AgentsConfig::default(),
             session: SessionConfig::default(),
+            push: PushConfig::default(),
+        }
+    }
+}
+
+/// `[push]` — host-reported turn completion notifications. Read on every
+/// delivery attempt, so `reload` applies changes without a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PushConfig {
+    /// Master switch. When false the host advertises `push.enabled = false`,
+    /// rejects new subscriptions and pauses (but keeps) its outbox.
+    pub enabled: bool,
+    /// Push Worker base URL. `None` falls back to the URL compiled into the
+    /// distributing binary (`App::push_worker_url`); an empty string disables
+    /// push even when the binary supplies a default.
+    pub worker_url: Option<String>,
+    /// Per-request HTTP timeout for Worker calls.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            worker_url: None,
+            request_timeout_secs: 10,
         }
     }
 }
@@ -66,6 +92,25 @@ pub struct AgentsConfig {
     pub devin: DevinAgentConfig,
     pub grok: GrokAgentConfig,
     pub shell: ShellAgentConfig,
+}
+
+impl AgentsConfig {
+    /// `enabled` flag for a wire agent name; unknown names are disabled.
+    pub fn enabled_by_name(&self, name: &str) -> bool {
+        match name {
+            "codex" => self.codex.enabled,
+            "pi" => self.pi.enabled,
+            "amp" => self.amp.enabled,
+            "opencode" => self.opencode.enabled,
+            "claude" => self.claude.enabled,
+            "droid" => self.droid.enabled,
+            "hermes" => self.hermes.enabled,
+            "devin" => self.devin.enabled,
+            "grok" => self.grok.enabled,
+            "shell" => self.shell.enabled,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,56 +367,32 @@ pub fn random_token() -> String {
     hex::encode(bytes)
 }
 
-async fn atomic_write(target: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = tmp_path(target);
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .await
-            .with_context(|| format!("opening {}", tmp.display()))?;
-        file.write_all(contents)
-            .await
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.flush().await.ok();
-        file.sync_all().await.ok();
-    }
-    set_mode_0600(&tmp)?;
-    fs::rename(&tmp, target)
-        .await
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), target.display()))?;
-    set_mode_0600(target)?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
-}
-
-#[cfg(unix)]
-fn set_mode_0600(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_mode_0600(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_section_defaults_and_round_trips() {
+        let config = HostConfig::default();
+        assert!(config.push.enabled);
+        assert_eq!(config.push.worker_url, None);
+        assert_eq!(config.push.request_timeout_secs, 10);
+
+        // Old host.toml without [push] still parses with defaults.
+        let old: HostConfig = toml::from_str("token = \"abc\"\n").unwrap();
+        assert_eq!(old.push, PushConfig::default());
+
+        // rotate/save rewrite the file from the typed struct, so [push] must
+        // survive a serialize → parse cycle.
+        let mut custom = HostConfig::default();
+        custom.push.enabled = false;
+        custom.push.worker_url = Some("https://push.example".into());
+        custom.push.request_timeout_secs = 3;
+        let text = toml::to_string_pretty(&custom).unwrap();
+        assert!(text.contains("[push]"));
+        let back: HostConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.push, custom.push);
+    }
 
     #[test]
     fn random_token_is_32_bytes_hex() {

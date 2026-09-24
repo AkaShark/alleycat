@@ -15,6 +15,7 @@ pub mod logs;
 pub mod onboarding;
 pub mod pair;
 pub mod probe;
+pub mod push;
 pub mod reload;
 pub mod rotate;
 pub mod status;

@@ -24,6 +24,7 @@ use crate::framing::{read_json_frame, write_json_frame};
 use crate::host;
 use crate::ipc::{ControlListener, ControlStream};
 use crate::paths;
+use crate::push;
 use crate::state;
 
 use self::control::{Request, Response, RotateResult, StatusInfo, token_fingerprint};
@@ -65,9 +66,31 @@ pub async fn run() -> anyhow::Result<()> {
     info!(node_id = %node_id, "loaded persistent identity");
 
     let endpoint = host::bind_endpoint(secret_key.clone()).await?;
-    let agents = AgentManager::new(Arc::clone(&config))
-        .await
-        .context("initializing agent manager")?;
+    let (reports_tx, reports_rx) = push::terminal_channel();
+    let agents = AgentManager::new(
+        Arc::clone(&config),
+        Some(push::bridge::BridgeTerminalObserver::shared(
+            reports_tx.clone(),
+        )),
+    )
+    .await
+    .context("initializing agent manager")?;
+
+    let push = push::PushService::start(push::PushParams {
+        config: Arc::clone(&config),
+        secret_key: secret_key.clone(),
+        files: push::store::PushFiles::from_state_dir().context("locating push state files")?,
+        app_worker_url: crate::app().push_worker_url.map(str::to_string),
+        reports_tx,
+        reports_rx,
+        codex: agents.codex_push_mode_supported().then(|| {
+            Arc::new(push::codex::AgentCodexConnector::new(agents.clone()))
+                as Arc<dyn push::codex::CodexConnector>
+        }),
+        policy: push::store::OutboxPolicy::default(),
+        watcher_timing: push::codex::WatcherTiming::default(),
+    })
+    .await;
 
     let started_at = Instant::now();
     let shutdown = Arc::new(Notify::new());
@@ -77,8 +100,9 @@ pub async fn run() -> anyhow::Result<()> {
         let agents = agents.clone();
         let config = Arc::clone(&config);
         let shutdown = Arc::clone(&shutdown);
+        let push = push.clone();
         tokio::spawn(async move {
-            if let Err(error) = host::accept_loop(endpoint, agents, config, shutdown).await {
+            if let Err(error) = host::accept_loop(endpoint, agents, push, config, shutdown).await {
                 error!("iroh accept loop ended: {error:#}");
             }
         })
@@ -92,6 +116,7 @@ pub async fn run() -> anyhow::Result<()> {
     let daemon = Arc::new(DaemonState {
         config: Arc::clone(&config),
         agents,
+        push,
         secret_key,
         endpoint: endpoint.clone(),
         node_id,
@@ -116,6 +141,14 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Stop push watchers and give the outbox a bounded final flush; anything
+    // left stays on disk and is resent by the next daemon.
+    info!("shutting down push service");
+    daemon
+        .push
+        .shutdown(std::time::Duration::from_secs(5))
+        .await;
+
     // Kill agent child processes (ACP, claude, …) deterministically.
     // Without this, only tokio's `kill_on_drop` keeps them honest, and
     // that's racy on process exit — between restarts we'd accumulate
@@ -130,6 +163,7 @@ pub async fn run() -> anyhow::Result<()> {
 struct DaemonState {
     config: Arc<ArcSwap<HostConfig>>,
     agents: AgentManager,
+    push: push::PushService,
     secret_key: iroh::SecretKey,
     endpoint: iroh::Endpoint,
     node_id: String,
@@ -186,6 +220,7 @@ async fn dispatch(daemon: Arc<DaemonState>, request: Request) -> (Response, Opti
         Request::Rotate => (handle_rotate(&daemon).await, None),
         Request::Reload => (handle_reload(&daemon).await, None),
         Request::AgentsList => (handle_agents_list(&daemon).await, None),
+        Request::PushStatus => (handle_push_status(&daemon).await, None),
         Request::Stop => (Response::ok(), Some(PostResponse::Shutdown)),
     }
 }
@@ -203,6 +238,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
         uptime_secs: daemon.started_at.elapsed().as_secs(),
         agents: daemon.agents.list_agents().await,
         version: Some(crate::binary_version().to_string()),
+        push: Some(daemon.push.status().await),
     };
     Response::ok_with(&info).unwrap_or_else(|e| Response::err(e.to_string()))
 }
@@ -247,7 +283,13 @@ async fn handle_reload(daemon: &DaemonState) -> Response {
         Err(error) => return Response::err(format!("loading config: {error:#}")),
     };
     daemon.config.store(Arc::new(new_cfg));
+    daemon.push.config_changed();
     Response::ok()
+}
+
+async fn handle_push_status(daemon: &DaemonState) -> Response {
+    let status = daemon.push.status().await;
+    Response::ok_with(&status).unwrap_or_else(|e| Response::err(e.to_string()))
 }
 
 async fn handle_agents_list(daemon: &DaemonState) -> Response {

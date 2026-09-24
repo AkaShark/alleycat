@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
-use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
+use alleycat_bridge_core::session::{
+    Session, SessionObserver, SessionRegistry, SessionRegistryConfig,
+};
 use alleycat_bridge_core::{
     Bridge, LaunchEnvironment, LaunchEnvironmentResolver, LocalLauncher, ProcessLauncher,
     UserEnvironmentLauncher,
@@ -35,6 +37,7 @@ use tracing::{info, warn};
 use crate::agent_manifest::{MANIFESTS, manifest_for};
 use crate::config::HostConfig;
 use crate::protocol::{AgentInfo, AgentWire};
+use crate::push::codex::CodexPushTarget;
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
@@ -133,6 +136,9 @@ pub struct AgentManager {
     codex_bin: PathBuf,
     /// Whether the selected codex executable could be spawned.
     codex_available: bool,
+    /// Last Unix app-server endpoint resolved for a phone stream, reused by
+    /// the push watcher's side connection.
+    codex_endpoint_cache: Arc<std::sync::Mutex<Option<CodexUnixEndpoint>>>,
     launch_env: LaunchEnvironmentResolver,
     session_registry: Arc<SessionRegistry>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
@@ -140,7 +146,12 @@ pub struct AgentManager {
 }
 
 impl AgentManager {
-    pub async fn new(config: Arc<ArcSwap<HostConfig>>) -> anyhow::Result<Self> {
+    /// `session_observer` is installed on every bridge session (push
+    /// notifications tap `turn/completed` through it).
+    pub async fn new(
+        config: Arc<ArcSwap<HostConfig>>,
+        session_observer: Option<Arc<dyn SessionObserver>>,
+    ) -> anyhow::Result<Self> {
         let snapshot = config.load();
 
         let launch_env = LaunchEnvironmentResolver::default();
@@ -271,7 +282,7 @@ impl AgentManager {
             idle_ttl: std::time::Duration::from_secs(session_cfg.idle_ttl_secs),
             pending_grace: std::time::Duration::from_secs(session_cfg.pending_grace_secs),
         };
-        let session_registry = SessionRegistry::new(registry_config);
+        let session_registry = SessionRegistry::with_observer(registry_config, session_observer);
         let reaper_handle = Arc::new(session_registry.spawn_reaper());
 
         let codex_detection = if snapshot.agents.codex.enabled {
@@ -301,6 +312,7 @@ impl AgentManager {
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
             codex_available: codex_detection.available,
+            codex_endpoint_cache: Arc::new(std::sync::Mutex::new(None)),
             launch_env,
             session_registry,
             _reaper_handle: reaper_handle,
@@ -455,19 +467,56 @@ impl AgentManager {
     }
 
     pub fn agent_enabled(&self, agent: &str) -> bool {
-        let cfg = self.config.load();
-        match agent {
-            "codex" => cfg.agents.codex.enabled,
-            "pi" => cfg.agents.pi.enabled,
-            "amp" => cfg.agents.amp.enabled,
-            "opencode" => cfg.agents.opencode.enabled,
-            "claude" => cfg.agents.claude.enabled,
-            "droid" => cfg.agents.droid.enabled,
-            "hermes" => cfg.agents.hermes.enabled,
-            "devin" => cfg.agents.devin.enabled,
-            "grok" => cfg.agents.grok.enabled,
-            "shell" => cfg.agents.shell.enabled,
-            _ => false,
+        self.config.load().agents.enabled_by_name(agent)
+    }
+
+    /// Whether the push Codex watcher can observe turn terminal states in
+    /// the detected transport mode. Stdio runs one app-server per phone
+    /// stream (killed with the stream), so there is nothing to watch.
+    pub fn codex_push_mode_supported(&self) -> bool {
+        self.codex_available
+            && match self.codex_mode {
+                CodexMode::UnixDaemon | CodexMode::UnixProxy => cfg!(unix),
+                CodexMode::Websocket => true,
+                CodexMode::Stdio => false,
+            }
+    }
+
+    /// Endpoint of the shared app-server for the push watcher's side
+    /// connection. With `refresh == false` a previously resolved Unix
+    /// endpoint is reused; otherwise the usual idempotent `ensure_*` path
+    /// runs (which may start Codex's own daemon / the shared child).
+    pub async fn codex_push_target(&self, refresh: bool) -> anyhow::Result<CodexPushTarget> {
+        if !self.codex_push_mode_supported() {
+            return Err(anyhow!("codex push watching is not supported in this mode"));
+        }
+        match self.codex_mode {
+            CodexMode::UnixDaemon | CodexMode::UnixProxy => {
+                let cached = self.codex_endpoint_cache.lock().unwrap().clone();
+                let endpoint = match cached {
+                    Some(endpoint) if !refresh => endpoint,
+                    _ => {
+                        let endpoint = if self.codex_mode == CodexMode::UnixDaemon {
+                            self.ensure_codex_daemon_running().await?
+                        } else {
+                            self.ensure_codex_unix_running().await?
+                        };
+                        *self.codex_endpoint_cache.lock().unwrap() = Some(endpoint.clone());
+                        endpoint
+                    }
+                };
+                let path = match endpoint.socket_path {
+                    Some(path) => path,
+                    None => default_codex_socket_for_push(&self.daemon_launch_env().await)
+                        .ok_or_else(|| anyhow!("cannot resolve codex app-server control socket"))?,
+                };
+                Ok(CodexPushTarget::Unix(path))
+            }
+            CodexMode::Websocket => {
+                let (host, port) = self.ensure_codex_running().await?;
+                Ok(CodexPushTarget::Tcp { host, port })
+            }
+            CodexMode::Stdio => Err(anyhow!("codex stdio mode cannot be watched")),
         }
     }
 
@@ -535,6 +584,7 @@ impl AgentManager {
         } else {
             self.ensure_codex_unix_running().await?
         };
+        *self.codex_endpoint_cache.lock().unwrap() = Some(endpoint.clone());
         let env = self.daemon_launch_env().await;
         let mut command = codex_command(&endpoint.bin);
         apply_launch_env_to_command(&mut command, &env);
@@ -1363,6 +1413,16 @@ async fn default_codex_control_socket_accepts_connections(
 async fn default_codex_control_socket_accepts_connections(
     _env: &LaunchEnvironment,
 ) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn default_codex_socket_for_push(env: &LaunchEnvironment) -> Option<PathBuf> {
+    default_codex_control_socket_path(env)
+}
+
+#[cfg(not(unix))]
+fn default_codex_socket_for_push(_env: &LaunchEnvironment) -> Option<PathBuf> {
     None
 }
 

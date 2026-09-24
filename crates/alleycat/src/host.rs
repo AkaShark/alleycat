@@ -13,6 +13,7 @@ use crate::agents::AgentManager;
 use crate::config::HostConfig;
 use crate::framing::{read_json_frame, write_json_frame};
 use crate::protocol::{ALLEYCAT_ALPN, PROTOCOL_VERSION, Request, Response, Resume, SessionInfo};
+use crate::push::{PushService, SubscribeRequest, UnsubscribeRequest};
 use crate::stream::IrohStream;
 
 /// Bind the iroh endpoint with the given identity and ALPN, returning it
@@ -65,6 +66,7 @@ pub async fn bind_endpoint(secret_key: SecretKey) -> anyhow::Result<Endpoint> {
 pub async fn accept_loop(
     endpoint: Endpoint,
     agents: AgentManager,
+    push: PushService,
     config: Arc<ArcSwap<HostConfig>>,
     shutdown: Arc<Notify>,
 ) -> anyhow::Result<()> {
@@ -81,6 +83,7 @@ pub async fn accept_loop(
                     break;
                 };
                 let agents = agents.clone();
+                let push = push.clone();
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     match connecting.await {
@@ -97,11 +100,12 @@ pub async fn accept_loop(
                             );
                             while let Ok((send, recv)) = conn.accept_bi().await {
                                 let agents = agents.clone();
+                                let push = push.clone();
                                 let config = Arc::clone(&config);
                                 let node_id = node_id.clone();
                                 tokio::spawn(async move {
                                     if let Err(error) = handle_stream(
-                                        send, recv, agents, config, conn_id, node_id,
+                                        send, recv, agents, push, config, conn_id, node_id,
                                     )
                                     .await
                                     {
@@ -124,6 +128,7 @@ async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     agents: AgentManager,
+    push: PushService,
     config: Arc<ArcSwap<HostConfig>>,
     conn: usize,
     node_id: String,
@@ -145,7 +150,68 @@ async fn handle_stream(
         Request::ListAgents { .. } => {
             info!(conn = conn, "list_agents");
             let list = agents.list_agents().await;
-            write_json_frame(&mut send, &Response::agents(list)).await?;
+            let host = push.host_info(&list);
+            write_json_frame(&mut send, &Response::agents_with_host(list, host)).await?;
+            Ok(())
+        }
+        Request::PushSubscribe {
+            agent,
+            thread_id,
+            turn_id,
+            target,
+            grant,
+            ..
+        } => {
+            // `node_id` is the authenticated iroh peer; the grant must be
+            // signed by that same device key.
+            let request = SubscribeRequest {
+                agent,
+                thread_id,
+                turn_id,
+                target,
+                grant,
+            };
+            let response = match push.subscribe(&node_id, request).await {
+                Ok(result) => Response::push(result),
+                Err(error) => {
+                    warn!(
+                        conn = conn,
+                        code = error.code,
+                        "push_subscribe rejected: {}",
+                        error.detail
+                    );
+                    Response::error(error.code)
+                }
+            };
+            write_json_frame(&mut send, &response).await?;
+            Ok(())
+        }
+        Request::PushUnsubscribe {
+            agent,
+            thread_id,
+            turn_id,
+            all,
+            ..
+        } => {
+            let request = UnsubscribeRequest {
+                agent,
+                thread_id,
+                turn_id,
+                all: all.unwrap_or(false),
+            };
+            let response = match push.unsubscribe(&node_id, request).await {
+                Ok(result) => Response::push(result),
+                Err(error) => {
+                    warn!(
+                        conn = conn,
+                        code = error.code,
+                        "push_unsubscribe rejected: {}",
+                        error.detail
+                    );
+                    Response::error(error.code)
+                }
+            };
+            write_json_frame(&mut send, &response).await?;
             Ok(())
         }
         Request::RestartAgent { agent, .. } => {
@@ -301,6 +367,7 @@ mod tests {
             relay: Some("https://relay.example".to_string()),
             agents: AgentsConfig::default(),
             session: crate::config::SessionConfig::default(),
+            push: crate::config::PushConfig::default(),
         };
 
         let payload = pair_payload(&secret_key, &config, None);

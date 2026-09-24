@@ -48,6 +48,15 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     } else {
         println!("  uptime (s):        <daemon not running>");
     }
+    if let Some(push) = &info.push {
+        println!(
+            "  push:              enabled={} worker={} subscriptions={} outbox={}",
+            push.enabled,
+            push.worker_host.as_deref().unwrap_or("<none>"),
+            push.subscriptions,
+            push.outbox_depth
+        );
+    }
     println!("  agents:");
     for agent in &info.agents {
         println!(
@@ -67,7 +76,7 @@ async fn offline_status() -> anyhow::Result<StatusInfo> {
     let cfg = crate::config::load_or_init().await?;
     let secret_key = crate::state::load_or_create_secret_key().await?;
     let agents_cfg = Arc::new(ArcSwap::from_pointee(cfg.clone()));
-    let agents = AgentManager::new(Arc::clone(&agents_cfg)).await?;
+    let agents = AgentManager::new(Arc::clone(&agents_cfg), None).await?;
     let agent_list: Vec<AgentInfo> = agents.list_agents().await;
     Ok(StatusInfo {
         pid: 0,
@@ -80,5 +89,6 @@ async fn offline_status() -> anyhow::Result<StatusInfo> {
         uptime_secs: 0,
         agents: agent_list,
         version: Some(crate::binary_version().to_string()),
+        push: None,
     })
 }

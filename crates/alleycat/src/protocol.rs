@@ -141,6 +141,64 @@ pub struct SessionInfo {
     pub floor_seq: u64,
 }
 
+/// Feature flag advertised in [`HostInfo::features`] by hosts that implement
+/// `push_subscribe` / `push_unsubscribe`.
+pub const FEATURE_PUSH_V1: &str = "push.v1";
+
+/// Host-level capabilities, attached to `list_agents` responses. Absent on
+/// hosts that predate it; clients treat that as "no optional features".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostInfo {
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<HostPushInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostPushInfo {
+    pub enabled: bool,
+    /// Agents whose turn terminal state this host can observe in its current
+    /// mode. Empty when push is disabled.
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
+/// Where the Worker should deliver the notification (`push_subscribe`).
+/// Enum-like fields are plain strings so a bad value yields a `bad_request`
+/// response instead of an undecodable first frame.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushTargetWire {
+    /// `ios` | `android`.
+    pub platform: String,
+    /// `sandbox` | `production`; iOS only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apns_environment: Option<String>,
+    /// Push token sealed to the Worker (base64url, spec §5.5). Opaque to the
+    /// host: stored and forwarded as-is, never parsed or logged.
+    pub sealed: String,
+}
+
+impl std::fmt::Debug for PushTargetWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushTargetWire")
+            .field("platform", &self.platform)
+            .field("apns_environment", &self.apns_environment)
+            .field("sealed", &format_args!("<{} bytes>", self.sealed.len()))
+            .finish()
+    }
+}
+
+/// Device-signed authorization for one subscription (`push_subscribe`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushGrantWire {
+    pub device_id: String,
+    pub issued: u64,
+    pub expires: u64,
+    pub nonce: String,
+    pub signature: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -160,14 +218,37 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<Resume>,
     },
+    PushSubscribe {
+        v: u32,
+        token: String,
+        agent: String,
+        thread_id: String,
+        turn_id: String,
+        target: PushTargetWire,
+        grant: PushGrantWire,
+    },
+    PushUnsubscribe {
+        v: u32,
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all: Option<bool>,
+    },
 }
 
 impl Request {
     pub fn version(&self) -> u32 {
         match self {
-            Self::ListAgents { v, .. } | Self::RestartAgent { v, .. } | Self::Connect { v, .. } => {
-                *v
-            }
+            Self::ListAgents { v, .. }
+            | Self::RestartAgent { v, .. }
+            | Self::Connect { v, .. }
+            | Self::PushSubscribe { v, .. }
+            | Self::PushUnsubscribe { v, .. } => *v,
         }
     }
 
@@ -175,9 +256,48 @@ impl Request {
         match self {
             Self::ListAgents { token, .. }
             | Self::RestartAgent { token, .. }
-            | Self::Connect { token, .. } => token,
+            | Self::Connect { token, .. }
+            | Self::PushSubscribe { token, .. }
+            | Self::PushUnsubscribe { token, .. } => token,
         }
     }
+}
+
+/// Whether the host has already registered the subscription with the Worker.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PushSubscriptionState {
+    Pending,
+    Registered,
+}
+
+/// Terminal notification type (`interrupted` is reported as `failed`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PushTerminalType {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushTerminalWire {
+    #[serde(rename = "type")]
+    pub kind: PushTerminalType,
+    pub occurred_at: u64,
+}
+
+/// `push` field of `push_subscribe` / `push_unsubscribe` responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PushResponse {
+    Subscribe {
+        subscription: PushSubscriptionState,
+        /// `null` while the turn is still running (or not yet known).
+        terminal: Option<PushTerminalWire>,
+    },
+    Unsubscribe {
+        removed: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -190,46 +310,267 @@ pub struct Response {
     pub session: Option<SessionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushResponse>,
 }
 
 impl Response {
-    pub fn ok() -> Self {
+    fn base(ok: bool) -> Self {
         Self {
             v: PROTOCOL_VERSION,
-            ok: true,
+            ok,
             agents: None,
             session: None,
             error: None,
+            host: None,
+            push: None,
         }
+    }
+
+    pub fn ok() -> Self {
+        Self::base(true)
     }
 
     pub fn ok_with_session(session: SessionInfo) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
-            ok: true,
-            agents: None,
             session: Some(session),
-            error: None,
+            ..Self::base(true)
         }
     }
 
-    pub fn agents(agents: Vec<AgentInfo>) -> Self {
+    pub fn agents_with_host(agents: Vec<AgentInfo>, host: HostInfo) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
-            ok: true,
             agents: Some(agents),
-            session: None,
-            error: None,
+            host: Some(host),
+            ..Self::base(true)
+        }
+    }
+
+    pub fn push(push: PushResponse) -> Self {
+        Self {
+            push: Some(push),
+            ..Self::base(true)
         }
     }
 
     pub fn error(error: impl Into<String>) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
-            ok: false,
-            agents: None,
-            session: None,
             error: Some(error.into()),
+            ..Self::base(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn subscribe_json() -> serde_json::Value {
+        json!({
+            "op": "push_subscribe",
+            "v": 1,
+            "token": "tok",
+            "agent": "codex",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "target": {
+                "platform": "ios",
+                "apns_environment": "production",
+                "sealed": "AQGsAbIgnoY1T7hTI3td"
+            },
+            "grant": {
+                "device_id": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+                "issued": 1790300000u64,
+                "expires": 1790386400u64,
+                "nonce": "ffeeddccbbaa99887766554433221100",
+                "signature": "c0bb"
+            }
+        })
+    }
+
+    #[test]
+    fn push_subscribe_parses_snake_case_wire() {
+        let request: Request = serde_json::from_value(subscribe_json()).unwrap();
+        assert_eq!(request.version(), 1);
+        assert_eq!(request.token(), "tok");
+        let Request::PushSubscribe {
+            agent,
+            thread_id,
+            turn_id,
+            target,
+            grant,
+            ..
+        } = request
+        else {
+            panic!("expected push_subscribe");
+        };
+        assert_eq!(agent, "codex");
+        assert_eq!(thread_id, "thread-1");
+        assert_eq!(turn_id, "turn-1");
+        assert_eq!(target.platform, "ios");
+        assert_eq!(target.apns_environment.as_deref(), Some("production"));
+        assert_eq!(target.sealed, "AQGsAbIgnoY1T7hTI3td");
+        // The sealed blob never shows up in logs.
+        assert!(!format!("{target:?}").contains("AQGsAbIgnoY1T7hTI3td"));
+        assert_eq!(grant.issued, 1790300000);
+        assert_eq!(grant.nonce, "ffeeddccbbaa99887766554433221100");
+    }
+
+    #[test]
+    fn push_subscribe_round_trips_and_android_omits_environment() {
+        let mut value = subscribe_json();
+        value["target"] = json!({"platform": "android", "sealed": "AQG-android_blob"});
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let back = serde_json::to_value(&request).unwrap();
+        assert_eq!(back, value);
+        assert!(back["target"].get("apns_environment").is_none());
+    }
+
+    #[test]
+    fn push_unsubscribe_fields_are_optional() {
+        let request: Request =
+            serde_json::from_value(json!({"op": "push_unsubscribe", "v": 1, "token": "t"}))
+                .unwrap();
+        assert!(matches!(
+            request,
+            Request::PushUnsubscribe {
+                agent: None,
+                thread_id: None,
+                turn_id: None,
+                all: None,
+                ..
+            }
+        ));
+        let request: Request = serde_json::from_value(json!({
+            "op": "push_unsubscribe", "v": 1, "token": "t", "all": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::PushUnsubscribe {
+                all: Some(true),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_op_still_fails_to_decode() {
+        // Old hosts close the stream on unknown ops; new hosts must keep that
+        // behavior for ops they don't know either.
+        let err = serde_json::from_value::<Request>(json!({"op": "push_future", "v": 1}));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn list_agents_response_carries_host_info() {
+        let response = Response::agents_with_host(
+            Vec::new(),
+            HostInfo {
+                features: vec![FEATURE_PUSH_V1.to_string()],
+                push: Some(HostPushInfo {
+                    enabled: true,
+                    agents: vec!["codex".into(), "claude".into()],
+                }),
+            },
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "v": 1,
+                "ok": true,
+                "agents": [],
+                "host": {
+                    "features": ["push.v1"],
+                    "push": {"enabled": true, "agents": ["codex", "claude"]}
+                }
+            })
+        );
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(back.host.unwrap().push.unwrap().agents.len(), 2);
+    }
+
+    #[test]
+    fn list_agents_response_without_host_still_parses() {
+        // What an old host sends.
+        let response: Response =
+            serde_json::from_value(json!({"v": 1, "ok": true, "agents": []})).unwrap();
+        assert!(response.host.is_none());
+        assert!(response.push.is_none());
+    }
+
+    #[test]
+    fn old_client_ignores_new_response_fields() {
+        // The response struct as it existed before push.v1.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldResponse {
+            v: u32,
+            ok: bool,
+            #[serde(default)]
+            agents: Option<Vec<AgentInfo>>,
+            #[serde(default)]
+            session: Option<SessionInfo>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let response = Response::agents_with_host(
+            Vec::new(),
+            HostInfo {
+                features: vec![FEATURE_PUSH_V1.to_string()],
+                push: None,
+            },
+        );
+        let old: OldResponse =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert!(old.ok);
+        assert_eq!(old.agents.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn push_subscribe_response_serializes_null_terminal() {
+        let pending = Response::push(PushResponse::Subscribe {
+            subscription: PushSubscriptionState::Pending,
+            terminal: None,
+        });
+        assert_eq!(
+            serde_json::to_value(&pending).unwrap(),
+            json!({"v": 1, "ok": true, "push": {"subscription": "pending", "terminal": null}})
+        );
+        let done = Response::push(PushResponse::Subscribe {
+            subscription: PushSubscriptionState::Registered,
+            terminal: Some(PushTerminalWire {
+                kind: PushTerminalType::Failed,
+                occurred_at: 1790300123,
+            }),
+        });
+        let value = serde_json::to_value(&done).unwrap();
+        assert_eq!(
+            value["push"],
+            json!({"subscription": "registered", "terminal": {"type": "failed", "occurred_at": 1790300123u64}})
+        );
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(back.push, done.push);
+    }
+
+    #[test]
+    fn push_unsubscribe_response_round_trips() {
+        let response = Response::push(PushResponse::Unsubscribe { removed: 2 });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["push"], json!({"removed": 2}));
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(back.push, Some(PushResponse::Unsubscribe { removed: 2 }));
+    }
+
+    #[test]
+    fn error_response_shape_is_unchanged() {
+        assert_eq!(
+            serde_json::to_value(Response::error("push_unsupported")).unwrap(),
+            json!({"v": 1, "ok": false, "error": "push_unsupported"})
+        );
     }
 }
