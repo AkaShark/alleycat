@@ -131,6 +131,8 @@ pub struct AcpBridge {
     /// Absolute cwd per session, recorded on thread/start, thread/resume
     /// and turn/start; used to restore sessions in a respawned process.
     session_cwds: DashMap<String, String>,
+    /// Latest ACP `configOptions` per session (model, thought_level, …).
+    session_config: DashMap<String, Vec<Value>>,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -174,6 +176,39 @@ impl AcpBridge {
 
     pub fn session_cwd(&self, session_id: &str) -> Option<String> {
         self.session_cwds.get(session_id).map(|c| c.clone())
+    }
+
+    /// Remember a session's ACP `configOptions` (and the model catalog in
+    /// them) from any response that carries them.
+    pub fn record_session_config(&self, session_id: &str, response: &Value) {
+        let options = crate::config_options::extract(response);
+        if options.is_empty() {
+            return;
+        }
+        let models = crate::config_options::find(&options, crate::config_options::MODEL)
+            .and_then(|o| o.get("options"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !models.is_empty() {
+            self.set_models(session_id, models);
+        }
+        self.session_config.insert(session_id.to_string(), options);
+    }
+
+    pub fn session_config(&self, session_id: &str) -> Vec<Value> {
+        self.session_config
+            .get(session_id)
+            .map(|o| o.clone())
+            .unwrap_or_default()
+    }
+
+    /// First session's option with this id (agent-wide traits such as the
+    /// thinking levels are the same for every session).
+    pub fn any_config_option(&self, id: &str) -> Option<Value> {
+        self.session_config
+            .iter()
+            .find_map(|entry| crate::config_options::find(entry.value(), id).cloned())
     }
 
     /// Test hook: kill this connection's primary ACP process, as idle
@@ -708,6 +743,7 @@ impl AcpBridgeBuilder {
                 .unwrap_or_else(crate::translate::default_client_capabilities),
             agent_capabilities: std::sync::RwLock::new(Value::Null),
             session_cwds: DashMap::new(),
+            session_config: DashMap::new(),
         }))
     }
 }

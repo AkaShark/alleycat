@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, instrument};
 
 use crate::acp_client::AcpClient;
+use crate::config_options;
 use crate::translate;
 
 /// ACP `session/new` and `session/load` require `cwd` to be an absolute
@@ -168,26 +169,6 @@ fn acp_model_to_codex(entry: &Value) -> p::Model {
         }],
         is_default: false,
     }
-}
-
-/// Pull the `options` array out of `session/new`'s `configOptions[id=model]`.
-/// Returns the raw ACP entries so the bridge can dedupe and we keep
-/// translation in one place.
-pub(crate) fn extract_models_from_config_options(session_new: &Value) -> Vec<Value> {
-    let options = session_new
-        .get("configOptions")
-        .and_then(|v| v.as_array())
-        .map(|v| v.iter())
-        .into_iter()
-        .flatten();
-    for opt in options {
-        if opt.get("id").and_then(|v| v.as_str()) == Some("model") {
-            if let Some(arr) = opt.get("options").and_then(|v| v.as_array()) {
-                return arr.clone();
-            }
-        }
-    }
-    Vec::new()
 }
 
 /// Pull `modes.currentModeId` and `modes.availableModes` out of
@@ -359,10 +340,8 @@ pub async fn handle_thread_start(
     // entries in `configOptions[]`. We stash the parsed shapes per
     // session so `model/list` and `collaborationMode/list` can serve
     // real data instead of placeholder rows.
-    let models = extract_models_from_config_options(&acp_response);
-    if !models.is_empty() {
-        bridge.set_models(&session_id, models);
-    }
+    bridge.record_session_config(&session_id, &acp_response);
+    apply_session_config(bridge, client, &session_id, typed.model.as_deref(), None).await;
     let modes = extract_modes_from_session_new(&acp_response);
     if modes.current.is_some() || !modes.available.is_empty() {
         bridge.set_modes(&session_id, modes);
@@ -393,7 +372,7 @@ pub async fn handle_thread_start(
             "agentRole": null,
             "turns": [],
         },
-        "model": &agent_id,
+        "model": reported_model(bridge, &session_id, &agent_id),
         "modelProvider": &agent_id,
         "cwd": cwd,
         "approvalPolicy": "on-request",
@@ -519,7 +498,7 @@ pub async fn handle_thread_resume(
         "mcpServers": [],
     });
 
-    let _acp_response = client
+    let acp_response = client
         .send_request("session/load", acp_request)
         .await
         .map_err(|e| JsonRpcError {
@@ -533,6 +512,7 @@ pub async fn handle_thread_resume(
         })?;
     client.mark_session_loaded(&typed.thread_id);
     bridge.set_session_cwd(&typed.thread_id, &cwd_sent);
+    bridge.record_session_config(&typed.thread_id, &acp_response);
 
     // session/load also streams `available_commands_update` ahead of the
     // response — cache whatever the agent sends so `skills/list` returns
@@ -572,7 +552,11 @@ pub async fn handle_thread_resume(
     // Missing any one of these makes the iOS deserializer reject the whole
     // resume with `missing field <foo>`.
     let cwd = typed.cwd.clone().unwrap_or_default();
-    let model = typed.model.clone().unwrap_or_else(|| agent_id.clone());
+    let model = reported_model(
+        bridge,
+        &typed.thread_id,
+        typed.model.as_deref().unwrap_or(&agent_id),
+    );
     let model_provider = typed
         .model_provider
         .clone()
@@ -971,6 +955,39 @@ pub fn handle_thread_name_set(
     p::ThreadSetNameResponse {}
 }
 
+/// Bring the session's model / thinking level in line with the request
+/// via `session/set_config_option`. Failures are logged, never fatal.
+pub async fn apply_session_config(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<p::ReasoningEffort>,
+) {
+    let options = bridge.session_config(session_id);
+    for (config_id, value) in config_options::pending_changes(&options, model, effort) {
+        let params = json!({"sessionId": session_id, "configId": config_id, "value": value});
+        match client
+            .send_request("session/set_config_option", params)
+            .await
+        {
+            Ok(response) => bridge.record_session_config(session_id, &response),
+            Err(err) => tracing::warn!(
+                session_id,
+                config_id,
+                value,
+                error = %err,
+                "set_config_option failed; continuing with the agent's current value"
+            ),
+        }
+    }
+}
+
+fn reported_model(bridge: &crate::bridge::AcpBridge, session_id: &str, fallback: &str) -> String {
+    config_options::current_value(&bridge.session_config(session_id), config_options::MODEL)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Make sure `session_id` is live in the process behind `client` before
 /// it is prompted: ACP agents keep sessions per process, so a respawned
 /// process answers `Session … not found` until the session is restored.
@@ -1009,7 +1026,7 @@ pub async fn ensure_session_ready(
         "session/load"
     };
     info!(session_id, method, cwd = %cwd, "restoring ACP session in fresh process");
-    client
+    let response = client
         .send_request(method, params)
         .await
         .map_err(|e| JsonRpcError {
@@ -1017,6 +1034,7 @@ pub async fn ensure_session_ready(
             message: format!("Failed to restore ACP session: {}", e),
             data: None,
         })?;
+    bridge.record_session_config(session_id, &response);
     if method == "session/load" {
         let _ = client.take_pending_notifications().await;
     }
@@ -1068,6 +1086,14 @@ pub async fn handle_turn_start(
         .and_then(|p| p.to_str())
         .map(str::to_string);
     ensure_session_ready(bridge, client, &typed.thread_id, request_cwd.as_deref()).await?;
+    apply_session_config(
+        bridge,
+        client,
+        &typed.thread_id,
+        typed.model.as_deref(),
+        typed.effort,
+    )
+    .await;
     info!("Starting turn for thread: {}", typed.thread_id);
 
     // Build ACP ContentBlock array from codex UserInput[]. Honors Text,
