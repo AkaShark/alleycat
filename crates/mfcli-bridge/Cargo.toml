@@ -1,0 +1,31 @@
+[package]
+name = "alleycat-mfcli-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "MyFlicker (mfcli) bridge: ACP over `mfcli acp` with multi-project thread/list."
+
+[package.metadata.dist]
+dist = false
+
+[lib]
+name = "alleycat_mfcli_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+alleycat-acp-bridge = { workspace = true }
+alleycat-bridge-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

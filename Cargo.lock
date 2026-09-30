@@ -324,6 +324,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "alleycat-mfcli-bridge"
+version = "0.1.0"
+dependencies = [
+ "alleycat-acp-bridge",
+ "alleycat-bridge-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "alleycat-opencode-bridge"
 version = "0.1.0"
 dependencies = [
