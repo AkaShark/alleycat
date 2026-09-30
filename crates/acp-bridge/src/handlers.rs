@@ -384,10 +384,15 @@ pub async fn handle_thread_start(
 /// Handle thread/list request.
 pub async fn handle_thread_list(
     client: &Arc<AcpClient>,
-    _params: p::ThreadListParams,
+    params: p::ThreadListParams,
 ) -> Result<Value, JsonRpcError> {
+    // Agents such as mfcli only list sessions for a given cwd.
+    let request = match params.cwd.as_ref().and_then(Value::as_str) {
+        Some(cwd) if cwd.starts_with('/') => json!({"cwd": cwd}),
+        _ => json!({}),
+    };
     // Try to use ACP's session/list if available
-    match client.send_request("session/list", json!({})).await {
+    match client.send_request("session/list", request).await {
         Ok(acp_response) => {
             // Parse ACP session list response
             let empty_sessions = vec![];
@@ -419,7 +424,7 @@ pub async fn handle_thread_list(
                         "updatedAt": updated_at,
                         "status": { "type": "idle" },
                         "path": "",
-                        "cwd": "",
+                        "cwd": session.get("cwd").and_then(|v| v.as_str()).unwrap_or(""),
                         "cliVersion": "",
                         "source": "appServer",
                         "threadSource": null,

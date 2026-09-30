@@ -178,6 +178,15 @@ impl AcpBridge {
         self.session_cwds.get(session_id).map(|c| c.clone())
     }
 
+    /// Secondary ACP process for this connection. Read-only calls
+    /// (`session/list`, model discovery) go here so they never queue
+    /// behind a streaming `session/prompt` on the primary process.
+    pub async fn ensure_aux_client(&self, ctx: &Conn) -> Result<Arc<crate::acp_client::AcpClient>> {
+        self.pool
+            .get_client(&format!("{}:aux", Self::session_key(ctx)))
+            .await
+    }
+
     /// Remember a session's ACP `configOptions` (and the model catalog in
     /// them) from any response that carries them.
     pub fn record_session_config(&self, session_id: &str, response: &Value) {
@@ -857,7 +866,11 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                handlers::handle_thread_list(&client, typed).await
+                let aux = self
+                    .ensure_aux_client(ctx)
+                    .await
+                    .map_err(|e| internal(format!("Failed to get ACP client: {e}")))?;
+                handlers::handle_thread_list(&aux, typed).await
             }
             "thread/start" => handlers::handle_thread_start(ctx, self, &client, params).await,
             "thread/resume" => handlers::handle_thread_resume(ctx, self, &client, params).await,
