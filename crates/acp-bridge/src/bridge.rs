@@ -133,6 +133,8 @@ pub struct AcpBridge {
     session_cwds: DashMap<String, String>,
     /// Latest ACP `configOptions` per session (model, thought_level, …).
     session_config: DashMap<String, Vec<Value>>,
+    /// Fetch the model catalog from a throwaway session when empty.
+    discover_models: bool,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -176,6 +178,10 @@ impl AcpBridge {
 
     pub fn session_cwd(&self, session_id: &str) -> Option<String> {
         self.session_cwds.get(session_id).map(|c| c.clone())
+    }
+
+    pub fn discover_models_enabled(&self) -> bool {
+        self.discover_models
     }
 
     /// Secondary ACP process for this connection. Read-only calls
@@ -529,6 +535,7 @@ pub struct AcpBridgeBuilder {
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
     client_capabilities: Option<Value>,
+    discover_models: bool,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -545,6 +552,7 @@ impl Default for AcpBridgeBuilder {
             state_dir: None,
             enable_persistence: false,
             client_capabilities: None,
+            discover_models: false,
         }
     }
 }
@@ -604,6 +612,14 @@ impl AcpBridgeBuilder {
     /// `translate::default_client_capabilities()`.
     pub fn client_capabilities(mut self, caps: Value) -> Self {
         self.client_capabilities = Some(caps);
+        self
+    }
+
+    /// When the model catalog is empty, `model/list` creates a throwaway
+    /// session in `$HOME` on the secondary process to fetch it. Only for
+    /// agents that do not persist prompt-less sessions (mfcli verified).
+    pub fn discover_models(mut self, enabled: bool) -> Self {
+        self.discover_models = enabled;
         self
     }
 
@@ -753,6 +769,7 @@ impl AcpBridgeBuilder {
             agent_capabilities: std::sync::RwLock::new(Value::Null),
             session_cwds: DashMap::new(),
             session_config: DashMap::new(),
+            discover_models: self.discover_models,
         }))
     }
 }
@@ -835,11 +852,7 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                to_value(handlers::handle_model_list(
-                    self,
-                    &ctx.session().agent,
-                    typed,
-                ))
+                to_value(handlers::handle_model_list(self, ctx, typed).await)
             }
             "experimentalFeature/list" => to_value(handlers::handle_experimental_feature_list()),
             "collaborationMode/list" => to_value(handlers::handle_collaboration_mode_list(self)),

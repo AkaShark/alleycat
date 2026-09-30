@@ -66,100 +66,168 @@ pub fn handle_config_requirements_read() -> p::ConfigRequirementsReadResponse {
     p::ConfigRequirementsReadResponse { requirements: None }
 }
 
-/// Handle model/list request. `agent_id` is the wire name of the agent
-/// this connection is bound to (e.g. `"devin"`), pulled from the iroh
-/// session — without it every ACP-backed agent would advertise the same
-/// `"acp-default"` model and the iOS picker would have no way to match
-/// the thread's `model` field against a real selection. Using the agent
-/// id keeps every ACP agent self-identifying while staying generic.
-pub fn handle_model_list(
+/// Traits shared by every model of an ACP agent: thinking levels from the
+/// `thought_level` config option and image input from `initialize`.
+struct ModelTraits {
+    efforts: Vec<p::ReasoningEffortOption>,
+    default_effort: p::ReasoningEffort,
+    modalities: Vec<Value>,
+    default_model: Option<String>,
+}
+
+impl ModelTraits {
+    fn from_bridge(bridge: &crate::bridge::AcpBridge) -> Self {
+        let thought = bridge.any_config_option(config_options::THOUGHT_LEVEL);
+        let mut efforts = Vec::new();
+        if let Some(opts) = thought
+            .as_ref()
+            .and_then(|t| t.get("options"))
+            .and_then(Value::as_array)
+        {
+            for opt in opts {
+                let value = opt.get("value").and_then(Value::as_str).unwrap_or("");
+                if let Some(effort) = config_options::effort_for(value) {
+                    efforts.push(p::ReasoningEffortOption {
+                        reasoning_effort: effort,
+                        description: opt
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(value)
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        let default_effort = thought
+            .as_ref()
+            .and_then(|t| t.get("currentValue"))
+            .and_then(Value::as_str)
+            .and_then(config_options::effort_for)
+            .unwrap_or(p::ReasoningEffort::Medium);
+        if efforts.is_empty() {
+            efforts.push(p::ReasoningEffortOption {
+                reasoning_effort: p::ReasoningEffort::Medium,
+                description: "Default".to_string(),
+            });
+        }
+        let image = bridge
+            .agent_capabilities()
+            .pointer("/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut modalities = vec![json!("text")];
+        if image {
+            modalities.push(json!("image"));
+        }
+        let default_model = bridge
+            .any_config_option(config_options::MODEL)
+            .and_then(|m| {
+                m.get("currentValue")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        Self {
+            efforts,
+            default_effort,
+            modalities,
+            default_model,
+        }
+    }
+}
+
+/// Handle model/list. With discovery enabled and no catalog yet, fetch it
+/// from a throwaway session first; otherwise fall back to one placeholder
+/// named after the agent (e.g. `"devin"`) so the phone can pin a thread's
+/// `model` field to a real selection.
+pub async fn handle_model_list(
     bridge: &crate::bridge::AcpBridge,
-    agent_id: &str,
+    ctx: &alleycat_bridge_core::Conn,
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
-    let cached = bridge.all_models();
-    if !cached.is_empty() {
-        let data: Vec<p::Model> = cached.iter().map(|m| acp_model_to_codex(m)).collect();
-        return p::ModelListResponse {
-            data,
-            next_cursor: None,
-        };
+    if bridge.all_models().is_empty() && bridge.discover_models_enabled() {
+        if let Err(err) = discover_models(bridge, ctx).await {
+            tracing::warn!(error = %err, "model discovery failed; returning placeholder");
+        }
     }
-    // Fallback: agent hasn't yet started a session so we have no
-    // catalog. Return a single placeholder so the iOS picker has at
-    // least one entry it can pin the active thread to.
-    let id = if agent_id.is_empty() {
-        "acp-default".to_string()
+    let traits = ModelTraits::from_bridge(bridge);
+    let cached = bridge.all_models();
+    let data: Vec<p::Model> = if cached.is_empty() {
+        let agent_id = ctx.session().agent.to_string();
+        let id = if agent_id.is_empty() {
+            "acp-default".to_string()
+        } else {
+            agent_id
+        };
+        let display_name = title_case(&id);
+        let description = format!("Default model for {display_name}");
+        vec![model_record(
+            &id,
+            &display_name,
+            &description,
+            &traits,
+            true,
+        )]
     } else {
-        agent_id.to_string()
+        cached
+            .iter()
+            .map(|entry| {
+                let id = entry
+                    .get("value")
+                    .or_else(|| entry.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let name = entry.get("name").and_then(Value::as_str).unwrap_or(id);
+                let description = entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let is_default = traits.default_model.as_deref() == Some(id);
+                model_record(id, name, description, &traits, is_default)
+            })
+            .collect()
     };
-    let display_name = title_case(&id);
-    let data = vec![p::Model {
-        id: id.clone(),
-        model: id,
-        upgrade: None,
-        upgrade_info: None,
-        availability_nux: None,
-        display_name: display_name.clone(),
-        description: format!("Default model for {display_name}"),
-        hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
-        input_modalities: vec![json!("text")],
-        supports_personality: false,
-        additional_speed_tiers: vec![],
-        service_tiers: vec![p::ModelServiceTier {
-            id: "standard".to_string(),
-            name: "Standard".to_string(),
-            description: "Standard service tier".to_string(),
-        }],
-        is_default: true,
-    }];
     p::ModelListResponse {
         data,
         next_cursor: None,
     }
 }
 
-/// Translate an ACP `configOptions[id=model].options[]` entry into
-/// codex `Model`. ACP exposes only `value` (the model id) + `name` (the
-/// display label); reasoning effort is implied by the model id (e.g.
-/// `claude-opus-4-7-high` vs `-low`) so we don't try to infer it.
-fn acp_model_to_codex(entry: &Value) -> p::Model {
-    let id = entry
-        .get("value")
-        .or_else(|| entry.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let display_name = entry
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(id.as_str())
-        .to_string();
-    let description = entry
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+async fn discover_models(
+    bridge: &crate::bridge::AcpBridge,
+    ctx: &alleycat_bridge_core::Conn,
+) -> anyhow::Result<()> {
+    let client = bridge.ensure_aux_client(ctx).await?;
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let response = client
+        .send_request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await?;
+    let session_id = response
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("session/new response missing sessionId"))?;
+    bridge.record_session_config(session_id, &response);
+    Ok(())
+}
+
+fn model_record(
+    id: &str,
+    name: &str,
+    description: &str,
+    traits: &ModelTraits,
+    is_default: bool,
+) -> p::Model {
     p::Model {
-        id: id.clone(),
-        model: id,
+        id: id.to_string(),
+        model: id.to_string(),
         upgrade: None,
         upgrade_info: None,
         availability_nux: None,
-        display_name,
-        description,
+        display_name: name.to_string(),
+        description: description.to_string(),
         hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
-        input_modalities: vec![json!("text")],
+        supported_reasoning_efforts: traits.efforts.clone(),
+        default_reasoning_effort: traits.default_effort,
+        input_modalities: traits.modalities.clone(),
         supports_personality: false,
         additional_speed_tiers: vec![],
         service_tiers: vec![p::ModelServiceTier {
@@ -167,7 +235,7 @@ fn acp_model_to_codex(entry: &Value) -> p::Model {
             name: "Standard".to_string(),
             description: "Standard service tier".to_string(),
         }],
-        is_default: false,
+        is_default,
     }
 }
 
