@@ -169,8 +169,10 @@ impl AcpBridge {
             .clone()
     }
 
+    /// Record a session's cwd. `/` is the placeholder used when the real
+    /// cwd is unknown, so it is never recorded.
     pub fn set_session_cwd(&self, session_id: &str, cwd: &str) {
-        if cwd.starts_with('/') {
+        if cwd.starts_with('/') && cwd != "/" {
             self.session_cwds
                 .insert(session_id.to_string(), cwd.to_string());
         }
@@ -892,7 +894,7 @@ impl Bridge for AcpBridge {
                 let typed: p::ThreadSetNameParams = decode(params)?;
                 to_value(handlers::handle_thread_name_set(ctx, self, typed))
             }
-            "thread/fork" => handlers::handle_thread_fork(ctx, &client, params).await,
+            "thread/fork" => handlers::handle_thread_fork(ctx, self, &client, params).await,
             "thread/rollback" => {
                 let typed: p::ThreadRollbackParams = decode(params)?;
                 handlers::handle_thread_rollback(typed)

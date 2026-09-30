@@ -1472,6 +1472,7 @@ pub async fn handle_command_exec(
 /// Handle thread/fork request.
 pub async fn handle_thread_fork(
     ctx: &alleycat_bridge_core::Conn,
+    bridge: &crate::bridge::AcpBridge,
     client: &Arc<AcpClient>,
     params: Value,
 ) -> Result<Value, JsonRpcError> {
@@ -1506,6 +1507,9 @@ pub async fn handle_thread_fork(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    client.mark_session_loaded(&new_session_id);
+    bridge.set_session_cwd(&new_session_id, &cwd);
+    bridge.record_session_config(&new_session_id, &acp_response);
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     let model = typed.model.clone().unwrap_or_else(|| agent_id.clone());

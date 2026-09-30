@@ -53,14 +53,15 @@ impl CwdIndex {
             .collect()
     }
 
-    /// Record `(sessionId, cwd, updatedAtMs)` triples; relative cwds are
-    /// ignored. Writes the file (atomically) only when something changed.
+    /// Record `(sessionId, cwd, updatedAtMs)` triples; relative cwds and
+    /// the `/` placeholder are ignored. Writes the file (atomically) only
+    /// when something changed.
     pub fn record_all(&self, items: impl IntoIterator<Item = (String, String, i64)>) {
         let snapshot = {
             let mut entries = self.entries.lock().expect("index poisoned");
             let mut changed = false;
             for (session_id, cwd, updated_at_ms) in items {
-                if !cwd.starts_with('/') {
+                if !cwd.starts_with('/') || cwd == "/" {
                     continue;
                 }
                 let entry = IndexEntry { cwd, updated_at_ms };
@@ -101,10 +102,12 @@ mod tests {
         index.record_all([
             ("s1".to_string(), "/p/one".to_string(), 10),
             ("s2".to_string(), "relative".to_string(), 11),
+            ("s3".to_string(), "/".to_string(), 12),
         ]);
         let reloaded = CwdIndex::load(path.clone());
         assert_eq!(reloaded.cwd_for("s1").as_deref(), Some("/p/one"));
         assert_eq!(reloaded.cwd_for("s2"), None);
+        assert_eq!(reloaded.cwd_for("s3"), None);
         assert!(!path.with_extension("json.tmp").exists());
     }
 

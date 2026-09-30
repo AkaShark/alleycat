@@ -383,9 +383,25 @@ impl AcpClient {
     }
 
     /// Kill the underlying agent process and abort the reader task.
+    /// True while a request is in flight on this process (e.g. a
+    /// streaming `session/prompt`).
+    pub fn is_busy(&self) -> bool {
+        self.request_lock.try_lock().is_err()
+    }
+
     pub async fn kill(&self) -> Result<()> {
         if let Some(handle) = self.reader_handle.lock().await.take() {
             handle.abort();
+        }
+        // The aborted reader can no longer answer outstanding requests;
+        // fail them now so callers don't wait forever.
+        self.closed.store(true, Ordering::SeqCst);
+        for (_id, tx) in self.inner.pending.lock().await.drain() {
+            let _ = tx.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32000, "message": "ACP agent process was stopped"},
+            }));
         }
         let mut process = self.process.lock().await;
         process

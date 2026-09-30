@@ -48,6 +48,9 @@ pub struct AcpPool {
     clients: DashMap<String, PoolEntry>,
     /// ACP `initialize` request sent to every process the pool spawns.
     init_request: std::sync::RwLock<Option<serde_json::Value>>,
+    /// One spawn at a time per key, so concurrent first requests for the
+    /// same connection share one process instead of racing to insert.
+    spawn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl AcpPool {
@@ -62,6 +65,7 @@ impl AcpPool {
             policy,
             clients: DashMap::new(),
             init_request: std::sync::RwLock::new(None),
+            spawn_locks: DashMap::new(),
         }
     }
 
@@ -74,21 +78,42 @@ impl AcpPool {
     /// Get or create an ACP client for the given session.
     #[instrument(skip(self), fields(session_id = %session_id))]
     pub async fn get_client(&self, session_id: &str) -> Result<Arc<AcpClient>> {
-        // Reuse a live client; replace one whose process has exited.
+        if let Some(client) = self.live_client(session_id).await {
+            return Ok(client);
+        }
+        let spawn_lock = Arc::clone(
+            self.spawn_locks
+                .entry(session_id.to_string())
+                .or_default()
+                .value(),
+        );
+        let _spawning = spawn_lock.lock().await;
+        // Another request may have spawned it while we waited.
+        if let Some(client) = self.live_client(session_id).await {
+            return Ok(client);
+        }
+        self.spawn_client(session_id).await
+    }
+
+    /// The pooled client for `session_id` if its process is alive; a client
+    /// whose process exited is removed.
+    async fn live_client(&self, session_id: &str) -> Option<Arc<AcpClient>> {
         let existing = self
             .clients
             .get(session_id)
             .map(|e| (Arc::clone(&e.client), Arc::clone(&e.last_access)));
-        if let Some((client, last_access)) = existing {
-            if !client.is_closed() {
-                *last_access.write().await = Instant::now();
-                debug!("Reusing existing ACP client for session");
-                return Ok(client);
-            }
-            warn!("ACP agent process exited; respawning");
-            self.remove_client(session_id).await;
+        let (client, last_access) = existing?;
+        if !client.is_closed() {
+            *last_access.write().await = Instant::now();
+            debug!("Reusing existing ACP client for session");
+            return Some(client);
         }
+        warn!("ACP agent process exited; respawning");
+        self.remove_client(session_id).await;
+        None
+    }
 
+    async fn spawn_client(&self, session_id: &str) -> Result<Arc<AcpClient>> {
         debug!("Creating new ACP client for session");
 
         // Check pool capacity and evict idle clients if needed
@@ -154,12 +179,27 @@ impl AcpPool {
     #[instrument(skip(self))]
     async fn evict_idle_clients(&self) {
         let now = Instant::now();
+        let snapshot: Vec<_> = self
+            .clients
+            .iter()
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    Arc::clone(&e.client),
+                    Arc::clone(&e.last_access),
+                )
+            })
+            .collect();
         let mut to_remove = Vec::new();
-
-        for entry in self.clients.iter() {
-            let last_access = *entry.last_access.read().await;
-            if now.duration_since(last_access) > self.policy.idle_ttl {
-                to_remove.push(entry.key().clone());
+        for (key, client, last_access) in snapshot {
+            // A long `session/prompt` is not idleness: keep the process and
+            // restart its idle clock.
+            if client.is_busy() {
+                *last_access.write().await = now;
+                continue;
+            }
+            if now.duration_since(*last_access.read().await) > self.policy.idle_ttl {
+                to_remove.push(key);
             }
         }
 
