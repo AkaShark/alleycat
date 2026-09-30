@@ -124,6 +124,8 @@ pub struct AcpBridge {
     /// it on `shutdown()` instead of relying on tokio runtime drop. Held
     /// in a `Mutex<Option<…>>` so `shutdown` can take it.
     eviction_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ACP `clientCapabilities` advertised in `initialize`.
+    client_capabilities: Value,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -139,6 +141,16 @@ impl std::fmt::Debug for AcpBridge {
 impl AcpBridge {
     pub fn builder() -> AcpBridgeBuilder {
         AcpBridgeBuilder::default()
+    }
+
+    /// Pool key for the connection's primary ACP process.
+    pub fn session_key(ctx: &Conn) -> String {
+        let session = ctx.session();
+        format!("{}:{}", session.agent, session.node_id)
+    }
+
+    pub fn client_capabilities(&self) -> &Value {
+        &self.client_capabilities
     }
 
     /// Ensure an ACP client exists for the given session, creating one if needed.
@@ -442,6 +454,7 @@ pub struct AcpBridgeBuilder {
     retry_backoff: Option<Duration>,
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
+    client_capabilities: Option<Value>,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -457,6 +470,7 @@ impl Default for AcpBridgeBuilder {
             retry_backoff: None,
             state_dir: None,
             enable_persistence: false,
+            client_capabilities: None,
         }
     }
 }
@@ -509,6 +523,13 @@ impl AcpBridgeBuilder {
 
     pub fn enable_persistence(mut self, enabled: bool) -> Self {
         self.enable_persistence = enabled;
+        self
+    }
+
+    /// ACP `clientCapabilities` to advertise in `initialize`. Defaults to
+    /// `translate::default_client_capabilities()`.
+    pub fn client_capabilities(mut self, caps: Value) -> Self {
+        self.client_capabilities = Some(caps);
         self
     }
 
@@ -595,8 +616,7 @@ impl AcpBridgeBuilder {
             request_timeout_secs: self.request_timeout.map(|d| d.as_secs()),
             max_retries: self.max_retries,
             retry_backoff_ms: self.retry_backoff.map(|d| d.as_millis() as u64),
-        }
-        .from_env();
+        };
 
         // Extract state_dir before moving config
         let state_dir_for_persistence = config.state_dir.clone();
@@ -653,6 +673,9 @@ impl AcpBridgeBuilder {
             thread_titles: DashMap::new(),
             persistence,
             eviction_handle: std::sync::Mutex::new(Some(eviction_handle)),
+            client_capabilities: self
+                .client_capabilities
+                .unwrap_or_else(crate::translate::default_client_capabilities),
         }))
     }
 }
@@ -672,8 +695,7 @@ impl AcpBridge {
 #[async_trait]
 impl Bridge for AcpBridge {
     async fn initialize(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let session = ctx.session();
-        let session_key = format!("{}:{}", session.agent, session.node_id);
+        let session_key = Self::session_key(ctx);
         let client = self
             .ensure_client(&session_key)
             .await
@@ -683,7 +705,7 @@ impl Bridge for AcpBridge {
                 data: None,
             })?;
 
-        handlers::handle_initialize(&client, params).await
+        handlers::handle_initialize(&client, self.client_capabilities(), params).await
     }
 
     async fn dispatch(
@@ -694,8 +716,7 @@ impl Bridge for AcpBridge {
     ) -> Result<Value, JsonRpcError> {
         debug!("Dispatching method: {}", method);
 
-        let session = ctx.session();
-        let session_key = format!("{}:{}", session.agent, session.node_id);
+        let session_key = Self::session_key(ctx);
         let client = self
             .ensure_client(&session_key)
             .await

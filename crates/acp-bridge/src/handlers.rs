@@ -25,13 +25,17 @@ fn coerce_absolute_cwd(cwd: Option<&str>) -> &str {
 /// Handle initialize request.
 pub async fn handle_initialize(
     client: &Arc<AcpClient>,
+    client_capabilities: &Value,
     params: Value,
 ) -> Result<Value, JsonRpcError> {
-    let acp_request = translate::codex_to_acp_initialize(&params).map_err(|e| JsonRpcError {
-        code: error_codes::INVALID_PARAMS,
-        message: format!("Failed to translate initialize params: {}", e),
-        data: None,
-    })?;
+    let acp_request =
+        translate::codex_to_acp_initialize(&params, client_capabilities).map_err(|e| {
+            JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!("Failed to translate initialize params: {}", e),
+                data: None,
+            }
+        })?;
 
     let acp_response = client
         .send_request("initialize", acp_request)

@@ -22,6 +22,11 @@ eula = false
 name = "alleycat-acp-bridge"
 path = "src/main.rs"
 
+# Test-only ACP agent used by the integration tests in `tests/`.
+[[bin]]
+name = "fake-acp-agent"
+path = "tests/support/fake_acp_agent.rs"
+
 [lib]
 name = "alleycat_acp_bridge"
 path = "src/lib.rs"

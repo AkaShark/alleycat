@@ -294,13 +294,19 @@ impl AcpClient {
 
         if let Some(error) = response.get("error") {
             error!(?error, "ACP agent returned error");
-            // Surface just the human-readable `message` so callers (and
-            // ultimately the iOS error toast) see a clean line.
+            // Surface the human-readable `message`, plus `data.details`
+            // when the agent puts the real reason there (mfcli always
+            // answers `Internal error` and explains in `details`).
             let message = error
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ACP agent returned an error");
-            anyhow::bail!("{message}");
+            match error.pointer("/data/details").and_then(|v| v.as_str()) {
+                Some(details) if !details.is_empty() && details != message => {
+                    anyhow::bail!("{message}: {details}")
+                }
+                _ => anyhow::bail!("{message}"),
+            }
         }
 
         Ok(response.get("result").cloned().unwrap_or(Value::Null))

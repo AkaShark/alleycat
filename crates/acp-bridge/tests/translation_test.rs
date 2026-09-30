@@ -12,11 +12,13 @@ fn test_codex_to_acp_initialize() {
         },
     });
 
-    let acp_request = alleycat_acp_bridge::translate::codex_to_acp_initialize(&codex_params);
+    let caps = alleycat_acp_bridge::translate::default_client_capabilities();
+    let acp_request = alleycat_acp_bridge::translate::codex_to_acp_initialize(&codex_params, &caps);
     assert!(acp_request.is_ok());
 
     let acp_request = acp_request.unwrap();
-    assert_eq!(acp_request["protocolVersion"], "1.0.0");
+    assert_eq!(acp_request["protocolVersion"], 1);
+    assert_eq!(acp_request["clientCapabilities"], caps);
     assert_eq!(acp_request["clientInfo"]["name"], "TestClient");
     assert_eq!(acp_request["clientInfo"]["version"], "1.0.0");
 }
@@ -43,8 +45,8 @@ fn test_acp_to_codex_initialize_result() {
     assert!(codex_result.is_ok());
 
     let codex_result = codex_result.unwrap();
-    assert_eq!(codex_result["serverInfo"]["name"], "TestAgent");
-    assert_eq!(codex_result["serverInfo"]["version"], "2.0.0");
+    let user_agent = codex_result["userAgent"].as_str().unwrap();
+    assert!(user_agent.contains("TestAgent 2.0.0"), "{user_agent}");
 }
 
 #[test]

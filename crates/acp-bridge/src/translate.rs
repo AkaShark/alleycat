@@ -2,23 +2,32 @@
 
 use serde_json::Value;
 
-/// Translate Codex InitializeParams to ACP InitializeRequest.
-pub fn codex_to_acp_initialize(codex_params: &Value) -> Result<Value, anyhow::Error> {
+/// Client capabilities the bridge advertises when the builder does not
+/// override them: the bridge can serve `fs/*` and `terminal/*` requests.
+pub fn default_client_capabilities() -> Value {
+    serde_json::json!({
+        "fs": {"readTextFile": true, "writeTextFile": true},
+        "terminal": true,
+    })
+}
+
+/// Translate Codex InitializeParams to ACP InitializeRequest. ACP defines
+/// `protocolVersion` as an integer (uint16); agents that validate it
+/// (mfcli) reject the string form.
+pub fn codex_to_acp_initialize(
+    codex_params: &Value,
+    client_capabilities: &Value,
+) -> Result<Value, anyhow::Error> {
+    let client_info = codex_params.get("clientInfo");
     let acp_request = serde_json::json!({
-        "protocolVersion": "1.0.0",
-        "clientCapabilities": {
-            "fs": {
-                "readTextFile": true,
-                "writeTextFile": true,
-            },
-            "terminal": true,
-        },
+        "protocolVersion": 1,
+        "clientCapabilities": client_capabilities,
         "clientInfo": {
-            "name": codex_params.get("clientInfo")
+            "name": client_info
                 .and_then(|v| v.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Alleycat"),
-            "version": codex_params.get("clientInfo")
+            "version": client_info
                 .and_then(|v| v.get("version"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("0.1.0"),
