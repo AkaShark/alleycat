@@ -2033,3 +2033,8 @@ mod codex_side {
         assert!(reads.load(Ordering::SeqCst) >= 2);
     }
 }
+
+#[test]
+fn mfcli_turns_are_push_eligible() {
+    assert!(super::BRIDGE_PUSH_AGENTS.contains(&"mfcli"));
+}

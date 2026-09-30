@@ -46,7 +46,7 @@ use self::store::{
 /// Bridge agents whose `turn/completed` frames flow through a bridge-core
 /// session (shell has no turns).
 pub const BRIDGE_PUSH_AGENTS: &[&str] = &[
-    "claude", "pi", "opencode", "amp", "droid", "hermes", "devin", "grok",
+    "claude", "pi", "opencode", "amp", "droid", "hermes", "devin", "grok", "mfcli",
 ];
 
 const MAX_SUBSCRIPTIONS: usize = 1000;

@@ -32,6 +32,7 @@ alleycat-claude-bridge = { workspace = true }
 alleycat-codex-proto = { workspace = true }
 alleycat-devin-bridge = { workspace = true }
 alleycat-grok-bridge = { workspace = true }
+alleycat-mfcli-bridge = { workspace = true }
 alleycat-droid-bridge = { workspace = true }
 alleycat-hermes-bridge = { workspace = true }
 alleycat-opencode-bridge = { workspace = true }

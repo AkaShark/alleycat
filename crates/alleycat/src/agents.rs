@@ -20,6 +20,7 @@ use alleycat_devin_bridge::DevinBridge;
 use alleycat_droid_bridge::DroidBridge;
 use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
+use alleycat_mfcli_bridge::{MfcliBridge, MfcliPaths};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use alleycat_shell_bridge::ShellBridge;
@@ -53,6 +54,7 @@ pub enum AgentKind {
     Hermes,
     Devin,
     Grok,
+    Mfcli,
     Shell,
 }
 
@@ -242,6 +244,19 @@ impl AgentManager {
         .await
         .context("building grok bridge")?;
 
+        // MyFlicker (`mfcli acp`) is another ACP agent; all mfcli launch
+        // and listing knowledge lives in `mfcli-bridge`.
+        let mfcli_state = crate::paths::state_dir()
+            .map(|dir| dir.join("mfcli"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("alleycat-mfcli"));
+        let mfcli_bridge = MfcliBridge::build(
+            PathBuf::from(&snapshot.agents.mfcli.bin),
+            MfcliPaths::default_for(&mfcli_state),
+            Arc::clone(&launcher),
+        )
+        .await
+        .context("building mfcli bridge")?;
+
         let shell_cfg = &snapshot.agents.shell;
         let mut shell_builder = ShellBridge::builder()
             .shell_bin(shell_cfg.shell_bin.clone())
@@ -258,6 +273,7 @@ impl AgentManager {
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Devin, devin_bridge);
         bridges.insert(AgentKind::Grok, grok_bridge);
+        bridges.insert(AgentKind::Mfcli, mfcli_bridge);
         bridges.insert(AgentKind::Shell, shell_bridge);
 
         let hermes_cfg = &snapshot.agents.hermes;
@@ -357,6 +373,7 @@ impl AgentManager {
                 "hermes" => self.hermes_available(&launch_env).await,
                 "devin" => self.devin_available(&launch_env),
                 "grok" => self.grok_available(&launch_env),
+                "mfcli" => self.mfcli_available(&launch_env),
                 "shell" => self.shell_available(),
                 _ => false,
             };
@@ -461,6 +478,7 @@ impl AgentManager {
             "hermes" => Some("hermes"),
             "devin" => Some("devin"),
             "grok" => Some("grok"),
+            "mfcli" => Some("mfcli"),
             "shell" => Some("shell"),
             _ => None,
         }
@@ -1031,6 +1049,11 @@ impl AgentManager {
         cfg.agents.grok.enabled && program_available(env, &cfg.agents.grok.bin)
     }
 
+    fn mfcli_available(&self, env: &LaunchEnvironment) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.mfcli.enabled && program_available(env, &cfg.agents.mfcli.bin)
+    }
+
     fn shell_available(&self) -> bool {
         let cfg = self.config.load();
         cfg.agents.shell.enabled && which::which(&cfg.agents.shell.shell_bin).is_ok()
@@ -1499,6 +1522,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "hermes" => Some(AgentKind::Hermes),
         "devin" => Some(AgentKind::Devin),
         "grok" => Some(AgentKind::Grok),
+        "mfcli" => Some(AgentKind::Mfcli),
         "shell" => Some(AgentKind::Shell),
         _ => None,
     }
@@ -1514,6 +1538,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Hermes => "hermes",
         AgentKind::Devin => "devin",
         AgentKind::Grok => "grok",
+        AgentKind::Mfcli => "mfcli",
         AgentKind::Shell => "shell",
     }
 }
@@ -1529,6 +1554,7 @@ impl crate::config::AgentsConfig {
             AgentKind::Hermes => self.hermes.enabled,
             AgentKind::Devin => self.devin.enabled,
             AgentKind::Grok => self.grok.enabled,
+            AgentKind::Mfcli => self.mfcli.enabled,
             AgentKind::Shell => self.shell.enabled,
         }
     }
@@ -1595,6 +1621,13 @@ fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mfcli_agent_kind_round_trips() {
+        assert_eq!(agent_kind_from_str("mfcli"), Some(AgentKind::Mfcli));
+        assert_eq!(agent_kind_str(AgentKind::Mfcli), "mfcli");
+        assert_eq!(AgentManager::agent_id("mfcli"), Some("mfcli"));
+    }
 
     #[test]
     fn factory_auth_accepts_v2_store() {

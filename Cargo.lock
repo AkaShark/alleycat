@@ -79,6 +79,7 @@ dependencies = [
  "alleycat-droid-bridge",
  "alleycat-grok-bridge",
  "alleycat-hermes-bridge",
+ "alleycat-mfcli-bridge",
  "alleycat-opencode-bridge",
  "alleycat-pi-bridge",
  "alleycat-shell-bridge",
