@@ -72,16 +72,15 @@ pub fn pending_changes(
     effort: Option<p::ReasoningEffort>,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
-    if let Some(model) = model {
-        if wants(options, MODEL, model) {
-            out.push((MODEL, model.to_string()));
-        }
+    if let Some(model) = model
+        && wants(options, MODEL, model)
+    {
+        out.push((MODEL, model.to_string()));
     }
-    if let Some(effort) = effort {
-        let level = thought_level_for(effort);
-        if wants(options, THOUGHT_LEVEL, level) {
-            out.push((THOUGHT_LEVEL, level.to_string()));
-        }
+    if let Some(effort) = effort
+        && wants(options, THOUGHT_LEVEL, thought_level_for(effort))
+    {
+        out.push((THOUGHT_LEVEL, thought_level_for(effort).to_string()));
     }
     out
 }

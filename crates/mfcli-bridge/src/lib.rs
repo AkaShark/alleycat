@@ -106,12 +106,11 @@ impl MfcliBridge {
     /// session in a fresh process (daemon restart, first turn on a thread
     /// the phone never resumed in this process).
     fn seed_session_cwd(&self, params: &Value) {
-        if let Some(id) = thread_id(params) {
-            if self.inner.session_cwd(&id).is_none() {
-                if let Some(cwd) = self.index.cwd_for(&id) {
-                    self.inner.set_session_cwd(&id, &cwd);
-                }
-            }
+        if let Some(id) = thread_id(params)
+            && self.inner.session_cwd(&id).is_none()
+            && let Some(cwd) = self.index.cwd_for(&id)
+        {
+            self.inner.set_session_cwd(&id, &cwd);
         }
     }
 
@@ -162,10 +161,10 @@ impl MfcliBridge {
             .get("cwd")
             .and_then(Value::as_str)
             .is_some_and(|c| c.starts_with('/'));
-        if let (Some(id), false) = (&id, has_cwd) {
-            if let (Some(cwd), Some(obj)) = (self.index.cwd_for(id), params.as_object_mut()) {
-                obj.insert("cwd".to_string(), json!(cwd));
-            }
+        if let (Some(id), false) = (&id, has_cwd)
+            && let (Some(cwd), Some(obj)) = (self.index.cwd_for(id), params.as_object_mut())
+        {
+            obj.insert("cwd".to_string(), json!(cwd));
         }
         let cwd = params
             .get("cwd")

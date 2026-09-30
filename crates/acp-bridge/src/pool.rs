@@ -110,11 +110,11 @@ impl AcpPool {
             .read()
             .expect("init_request poisoned")
             .clone();
-        if let Some(request) = init_request {
-            if let Err(err) = client.ensure_initialized(&request).await {
-                let _ = client.kill().await;
-                return Err(err);
-            }
+        if let Some(request) = init_request
+            && let Err(err) = client.ensure_initialized(&request).await
+        {
+            let _ = client.kill().await;
+            return Err(err);
         }
         let last_access = Arc::new(RwLock::new(Instant::now()));
 

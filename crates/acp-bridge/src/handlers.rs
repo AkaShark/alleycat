@@ -144,10 +144,11 @@ pub async fn handle_model_list(
     ctx: &alleycat_bridge_core::Conn,
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
-    if bridge.all_models().is_empty() && bridge.discover_models_enabled() {
-        if let Err(err) = discover_models(bridge, ctx).await {
-            tracing::warn!(error = %err, "model discovery failed; returning placeholder");
-        }
+    if bridge.all_models().is_empty()
+        && bridge.discover_models_enabled()
+        && let Err(err) = discover_models(bridge, ctx).await
+    {
+        tracing::warn!(error = %err, "model discovery failed; returning placeholder");
     }
     let traits = ModelTraits::from_bridge(bridge);
     let cached = bridge.all_models();

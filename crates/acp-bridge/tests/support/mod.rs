@@ -104,8 +104,8 @@ impl Harness {
     pub fn last_frame(&self, method: &str) -> Value {
         self.frames()
             .into_iter()
-            .filter(|f| f["method"] == method)
-            .last()
+            .rev()
+            .find(|f| f["method"] == method)
             .unwrap_or_else(|| panic!("agent never received {method}"))
     }
 }
