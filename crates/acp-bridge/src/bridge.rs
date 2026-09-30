@@ -126,6 +126,11 @@ pub struct AcpBridge {
     eviction_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// ACP `clientCapabilities` advertised in `initialize`.
     client_capabilities: Value,
+    /// `agentCapabilities` from the agent's `initialize` response.
+    agent_capabilities: std::sync::RwLock<Value>,
+    /// Absolute cwd per session, recorded on thread/start, thread/resume
+    /// and turn/start; used to restore sessions in a respawned process.
+    session_cwds: DashMap<String, String>,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -151,6 +156,31 @@ impl AcpBridge {
 
     pub fn client_capabilities(&self) -> &Value {
         &self.client_capabilities
+    }
+
+    pub fn agent_capabilities(&self) -> Value {
+        self.agent_capabilities
+            .read()
+            .expect("agent_capabilities poisoned")
+            .clone()
+    }
+
+    pub fn set_session_cwd(&self, session_id: &str, cwd: &str) {
+        if cwd.starts_with('/') {
+            self.session_cwds
+                .insert(session_id.to_string(), cwd.to_string());
+        }
+    }
+
+    pub fn session_cwd(&self, session_id: &str) -> Option<String> {
+        self.session_cwds.get(session_id).map(|c| c.clone())
+    }
+
+    /// Test hook: kill this connection's primary ACP process, as idle
+    /// eviction would. The next request respawns it.
+    #[doc(hidden)]
+    pub async fn recycle_process(&self, ctx: &Conn) {
+        self.pool.remove_client(&Self::session_key(ctx)).await;
     }
 
     /// Ensure an ACP client exists for the given session, creating one if needed.
@@ -676,6 +706,8 @@ impl AcpBridgeBuilder {
             client_capabilities: self
                 .client_capabilities
                 .unwrap_or_else(crate::translate::default_client_capabilities),
+            agent_capabilities: std::sync::RwLock::new(Value::Null),
+            session_cwds: DashMap::new(),
         }))
     }
 }
@@ -695,17 +727,23 @@ impl AcpBridge {
 #[async_trait]
 impl Bridge for AcpBridge {
     async fn initialize(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let session_key = Self::session_key(ctx);
+        let request = crate::translate::codex_to_acp_initialize(&params, &self.client_capabilities)
+            .map_err(|e| invalid_params(format!("Failed to translate initialize params: {e}")))?;
+        self.pool.set_init_request(request.clone());
         let client = self
-            .ensure_client(&session_key)
+            .ensure_client(&Self::session_key(ctx))
             .await
-            .map_err(|e| JsonRpcError {
-                code: error_codes::INTERNAL_ERROR,
-                message: format!("Failed to create ACP client: {}", e),
-                data: None,
-            })?;
-
-        handlers::handle_initialize(&client, self.client_capabilities(), params).await
+            .map_err(|e| internal(format!("Failed to create ACP client: {e}")))?;
+        let response = handlers::handle_initialize(&client, &request).await?;
+        *self
+            .agent_capabilities
+            .write()
+            .expect("agent_capabilities poisoned") = response
+            .get("agentCapabilities")
+            .cloned()
+            .unwrap_or(Value::Null);
+        crate::translate::acp_to_codex_initialize_result(&response)
+            .map_err(|e| internal(format!("Failed to translate initialize response: {e}")))
     }
 
     async fn dispatch(

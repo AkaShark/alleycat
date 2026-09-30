@@ -22,35 +22,20 @@ fn coerce_absolute_cwd(cwd: Option<&str>) -> &str {
     }
 }
 
-/// Handle initialize request.
+/// Initialize the process behind `client` (once) and return the raw ACP
+/// `initialize` response.
 pub async fn handle_initialize(
     client: &Arc<AcpClient>,
-    client_capabilities: &Value,
-    params: Value,
+    acp_request: &Value,
 ) -> Result<Value, JsonRpcError> {
-    let acp_request =
-        translate::codex_to_acp_initialize(&params, client_capabilities).map_err(|e| {
-            JsonRpcError {
-                code: error_codes::INVALID_PARAMS,
-                message: format!("Failed to translate initialize params: {}", e),
-                data: None,
-            }
-        })?;
-
-    let acp_response = client
-        .send_request("initialize", acp_request)
+    client
+        .ensure_initialized(acp_request)
         .await
         .map_err(|e| JsonRpcError {
             code: error_codes::INTERNAL_ERROR,
             message: format!("Failed to send initialize to ACP agent: {}", e),
             data: None,
-        })?;
-
-    translate::acp_to_codex_initialize_result(&acp_response).map_err(|e| JsonRpcError {
-        code: error_codes::INTERNAL_ERROR,
-        message: format!("Failed to translate initialize response: {}", e),
-        data: None,
-    })
+        })
 }
 
 /// Handle account/read request.
@@ -343,6 +328,11 @@ pub async fn handle_thread_start(
             data: None,
         })?;
 
+    let sent_cwd = acp_request
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("/")
+        .to_string();
     let acp_response = client
         .send_request("session/new", acp_request)
         .await
@@ -361,6 +351,8 @@ pub async fn handle_thread_start(
             data: None,
         })?
         .to_string();
+    client.mark_session_loaded(&session_id);
+    bridge.set_session_cwd(&session_id, &sent_cwd);
 
     // Capture models + modes advertised by `session/new`. ACP doesn't
     // have dedicated model_list / mode_list methods — both arrive as
@@ -520,9 +512,10 @@ pub async fn handle_thread_resume(
     // session's original cwd. Devin's serde tolerates `""`, but grok
     // rejects relative paths with `-32602 Invalid params: Path is not
     // absolute: `, so fall back to `/` when the client didn't supply one.
+    let cwd_sent = coerce_absolute_cwd(typed.cwd.as_deref()).to_string();
     let acp_request = json!({
         "sessionId": typed.thread_id,
-        "cwd": coerce_absolute_cwd(typed.cwd.as_deref()),
+        "cwd": cwd_sent,
         "mcpServers": [],
     });
 
@@ -538,6 +531,8 @@ pub async fn handle_thread_resume(
             message: e.to_string(),
             data: None,
         })?;
+    client.mark_session_loaded(&typed.thread_id);
+    bridge.set_session_cwd(&typed.thread_id, &cwd_sent);
 
     // session/load also streams `available_commands_update` ahead of the
     // response — cache whatever the agent sends so `skills/list` returns
@@ -976,6 +971,60 @@ pub fn handle_thread_name_set(
     p::ThreadSetNameResponse {}
 }
 
+/// Make sure `session_id` is live in the process behind `client` before
+/// it is prompted: ACP agents keep sessions per process, so a respawned
+/// process answers `Session … not found` until the session is restored.
+/// Prefers `session/resume` (no replay), falls back to `session/load`
+/// (replay discarded); agents that support neither are prompted as-is.
+pub async fn ensure_session_ready(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    fallback_cwd: Option<&str>,
+) -> Result<(), JsonRpcError> {
+    if client.is_session_loaded(session_id) {
+        return Ok(());
+    }
+    let caps = bridge.agent_capabilities();
+    let can_resume = caps.pointer("/sessionCapabilities/resume").is_some();
+    let can_load = caps
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !can_resume && !can_load {
+        return Ok(());
+    }
+    let cwd = bridge
+        .session_cwd(session_id)
+        .or_else(|| {
+            fallback_cwd
+                .filter(|c| c.starts_with('/'))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "/".to_string());
+    let params = json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []});
+    let method = if can_resume {
+        "session/resume"
+    } else {
+        "session/load"
+    };
+    info!(session_id, method, cwd = %cwd, "restoring ACP session in fresh process");
+    client
+        .send_request(method, params)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: format!("Failed to restore ACP session: {}", e),
+            data: None,
+        })?;
+    if method == "session/load" {
+        let _ = client.take_pending_notifications().await;
+    }
+    bridge.set_session_cwd(session_id, &cwd);
+    client.mark_session_loaded(session_id);
+    Ok(())
+}
+
 /// Handle turn/start request.
 ///
 /// Lifecycle:
@@ -1013,6 +1062,12 @@ pub async fn handle_turn_start(
     })?;
 
     tracing::Span::current().record("thread_id", &typed.thread_id);
+    let request_cwd = typed
+        .cwd
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
+    ensure_session_ready(bridge, client, &typed.thread_id, request_cwd.as_deref()).await?;
     info!("Starting turn for thread: {}", typed.thread_id);
 
     // Build ACP ContentBlock array from codex UserInput[]. Honors Text,

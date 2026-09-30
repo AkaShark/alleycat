@@ -46,6 +46,8 @@ pub struct AcpPool {
     launcher: Arc<dyn ProcessLauncher>,
     policy: PoolPolicy,
     clients: DashMap<String, PoolEntry>,
+    /// ACP `initialize` request sent to every process the pool spawns.
+    init_request: std::sync::RwLock<Option<serde_json::Value>>,
 }
 
 impl AcpPool {
@@ -59,17 +61,32 @@ impl AcpPool {
             launcher,
             policy,
             clients: DashMap::new(),
+            init_request: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Remember the ACP `initialize` request so processes spawned later
+    /// (after idle eviction or a crash) are initialized before first use.
+    pub fn set_init_request(&self, request: serde_json::Value) {
+        *self.init_request.write().expect("init_request poisoned") = Some(request);
     }
 
     /// Get or create an ACP client for the given session.
     #[instrument(skip(self), fields(session_id = %session_id))]
     pub async fn get_client(&self, session_id: &str) -> Result<Arc<AcpClient>> {
-        // First, try to get existing client and update access time
-        if let Some(entry) = self.clients.get(session_id) {
-            *entry.last_access.write().await = Instant::now();
-            debug!("Reusing existing ACP client for session");
-            return Ok(Arc::clone(&entry.client));
+        // Reuse a live client; replace one whose process has exited.
+        let existing = self
+            .clients
+            .get(session_id)
+            .map(|e| (Arc::clone(&e.client), Arc::clone(&e.last_access)));
+        if let Some((client, last_access)) = existing {
+            if !client.is_closed() {
+                *last_access.write().await = Instant::now();
+                debug!("Reusing existing ACP client for session");
+                return Ok(client);
+            }
+            warn!("ACP agent process exited; respawning");
+            self.remove_client(session_id).await;
         }
 
         debug!("Creating new ACP client for session");
@@ -88,6 +105,17 @@ impl AcpPool {
 
         // Create new client
         let client = Arc::new(AcpClient::spawn(&self.config, &self.launcher).await?);
+        let init_request = self
+            .init_request
+            .read()
+            .expect("init_request poisoned")
+            .clone();
+        if let Some(request) = init_request {
+            if let Err(err) = client.ensure_initialized(&request).await {
+                let _ = client.kill().await;
+                return Err(err);
+            }
+        }
         let last_access = Arc::new(RwLock::new(Instant::now()));
 
         self.clients.insert(
