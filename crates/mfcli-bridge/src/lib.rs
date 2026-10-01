@@ -6,9 +6,10 @@
 //!   directory), with the client advertising no fs/terminal support (mfcli
 //!   runs its own tools) and model discovery enabled (mfcli does not
 //!   persist prompt-less sessions);
-//! - `thread/list`: mfcli's `session/list` needs a `cwd`, so the bridge
-//!   lists every known project (`~/.codeflicker/data.json` + its own cwd
-//!   index + the request's cwd) on the secondary process and merges;
+//! - `thread/list`: mfcli's `session/list` only sees its own process's
+//!   project, so the bridge reads mfcli's session files for every known
+//!   project (`~/.codeflicker/data.json` + its own cwd index + the
+//!   request's cwd) and merges;
 //! - `thread/start` / `thread/fork` / `thread/resume` / `turn/start`: keep
 //!   the cwd index current and give the generic bridge a session's real
 //!   cwd; an unknown cwd is an error, never a silent `/`.
@@ -16,6 +17,7 @@
 pub mod index;
 pub mod listing;
 pub mod projects;
+pub mod storage;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,6 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::index::CwdIndex;
-use crate::listing::SessionLister;
 
 #[derive(Debug, Clone)]
 pub struct MfcliPaths {
@@ -36,6 +37,8 @@ pub struct MfcliPaths {
     pub data_json: PathBuf,
     /// Where the bridge keeps its `sessionId → cwd` index.
     pub index_file: PathBuf,
+    /// mfcli's session store (`~/.codeflicker/projects`).
+    pub projects_dir: PathBuf,
 }
 
 impl MfcliPaths {
@@ -46,6 +49,7 @@ impl MfcliPaths {
         Self {
             data_json: home.join(".codeflicker/data.json"),
             index_file: state_dir.join("mfcli-sessions.json"),
+            projects_dir: home.join(".codeflicker/projects"),
         }
     }
 }
@@ -54,6 +58,7 @@ pub struct MfcliBridge {
     inner: Arc<AcpBridge>,
     index: CwdIndex,
     data_json: PathBuf,
+    projects_dir: PathBuf,
 }
 
 fn internal(message: impl Into<String>) -> JsonRpcError {
@@ -81,6 +86,7 @@ impl MfcliBridge {
             inner,
             index: CwdIndex::load(paths.index_file),
             data_json: paths.data_json,
+            projects_dir: paths.projects_dir,
         }
     }
 
@@ -125,46 +131,38 @@ impl MfcliBridge {
             .or_else(|| self.index.cwd_for(session_id))
     }
 
-    /// Find a session's project by listing every known project (refreshes
-    /// the index as a side effect).
-    async fn resolve_cwd(&self, lister: &dyn SessionLister, session_id: &str) -> Option<String> {
+    /// Find a session's project among the known projects by looking for
+    /// its file in mfcli's store; remembers the answer in the index.
+    async fn resolve_cwd(&self, session_id: &str) -> Option<String> {
         let cwds = self.candidate_cwds().await;
-        let sessions = listing::collect_sessions(lister, &cwds).await;
-        self.index.record_all(
-            sessions
-                .iter()
-                .map(|s| (s.session_id.clone(), s.cwd.clone(), s.updated_at_ms)),
-        );
-        sessions
-            .into_iter()
-            .find(|s| s.session_id == session_id)
-            .map(|s| s.cwd)
+        let projects_dir = self.projects_dir.clone();
+        let id = session_id.to_string();
+        let cwd =
+            tokio::task::spawn_blocking(move || storage::find_session(&projects_dir, &cwds, &id))
+                .await
+                .ok()
+                .flatten()?;
+        self.index
+            .record_all([(session_id.to_string(), cwd.clone(), now_ms())]);
+        Some(cwd)
     }
 
     /// The session's real cwd. mfcli runs tools in the session's cwd, so an
     /// unknown cwd is an error rather than a silent `/`.
     async fn cwd_for_session(
         &self,
-        ctx: &Conn,
         session_id: &str,
         params: &Value,
     ) -> Result<String, JsonRpcError> {
         if let Some(cwd) = self.known_cwd(session_id, params) {
             return Ok(cwd);
         }
-        let client = self
-            .inner
-            .ensure_aux_client(ctx)
-            .await
-            .map_err(|e| internal(format!("Failed to get mfcli ACP client: {e}")))?;
-        self.resolve_cwd(client.as_ref(), session_id)
-            .await
-            .ok_or_else(|| {
-                internal(format!(
-                    "MyFlicker could not find the project directory of session {session_id}; \
-                     refresh the task list and try again"
-                ))
-            })
+        self.resolve_cwd(session_id).await.ok_or_else(|| {
+            internal(format!(
+                "MyFlicker could not find the project directory of session {session_id}; \
+                 refresh the task list and try again"
+            ))
+        })
     }
 
     /// Project directories to list: mfcli's own projects plus every cwd
@@ -192,15 +190,15 @@ impl MfcliBridge {
         } else {
             requested.into_iter().collect()
         };
-        let client = self
-            .inner
-            .ensure_aux_client(ctx)
-            .await
-            .map_err(|e| internal(format!("Failed to get mfcli ACP client: {e}")))?;
-        let sessions = listing::merge(
-            listing::collect_sessions(client.as_ref(), &cwds).await,
-            limit,
-        );
+        let projects_dir = self.projects_dir.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            cwds.iter()
+                .flat_map(|cwd| storage::sessions_in(&projects_dir, cwd))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| internal(format!("mfcli thread/list worker failed: {e}")))?;
+        let sessions = listing::merge(found, limit);
         self.index.record_all(
             sessions
                 .iter()
@@ -218,7 +216,7 @@ impl MfcliBridge {
         let Some(id) = thread_id(&params) else {
             return self.inner.dispatch(ctx, "thread/resume", params).await;
         };
-        let cwd = self.cwd_for_session(ctx, &id, &params).await?;
+        let cwd = self.cwd_for_session(&id, &params).await?;
         if let Some(obj) = params.as_object_mut() {
             obj.insert("cwd".to_string(), json!(cwd));
         }
@@ -234,7 +232,7 @@ impl MfcliBridge {
         if let Some(id) = thread_id(&params)
             && self.inner.session_cwd(&id).is_none()
         {
-            let cwd = self.cwd_for_session(ctx, &id, &params).await?;
+            let cwd = self.cwd_for_session(&id, &params).await?;
             self.inner.set_session_cwd(&id, &cwd);
         }
         self.inner.dispatch(ctx, "turn/start", params).await
@@ -299,6 +297,7 @@ mod tests {
         MfcliPaths {
             data_json: dir.join("data.json"),
             index_file: dir.join("idx.json"),
+            projects_dir: dir.join("projects"),
         }
     }
 
@@ -312,21 +311,6 @@ mod tests {
         )
         .await;
         assert!(bridge.is_ok());
-    }
-
-    struct OneProjectLister;
-
-    #[async_trait]
-    impl SessionLister for OneProjectLister {
-        async fn list_page(&self, cwd: &str, _cursor: Option<&str>) -> anyhow::Result<Value> {
-            if cwd == "/p" {
-                Ok(
-                    json!({"sessions": [{"sessionId": "s9", "cwd": "/p", "title": "t", "updatedAt": "2026-09-30T10:00:00Z"}]}),
-                )
-            } else {
-                Ok(json!({"sessions": []}))
-            }
-        }
     }
 
     #[tokio::test]
@@ -366,18 +350,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_cwd_finds_session_by_listing_projects() {
+    async fn resolve_cwd_finds_session_in_mfcli_storage() {
         let dir = tempfile::tempdir().unwrap();
         let p = paths(dir.path());
         std::fs::write(&p.data_json, r#"{"projects": {"/p": {}, "/q": {}}}"#).unwrap();
+        let session_dir = p.projects_dir.join(storage::project_slug("/p"));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("s9.jsonl"),
+            r#"{"type":"message","role":"user","content":"hi"}"#,
+        )
+        .unwrap();
         let bridge = MfcliBridge::build("/nonexistent/mfcli", p, Arc::new(LocalLauncher))
             .await
             .unwrap();
-        assert_eq!(
-            bridge.resolve_cwd(&OneProjectLister, "s9").await.as_deref(),
-            Some("/p")
-        );
+        assert_eq!(bridge.resolve_cwd("s9").await.as_deref(), Some("/p"));
         assert_eq!(bridge.index.cwd_for("s9").as_deref(), Some("/p"));
-        assert_eq!(bridge.resolve_cwd(&OneProjectLister, "missing").await, None);
+        assert_eq!(bridge.resolve_cwd("missing").await, None);
     }
 }

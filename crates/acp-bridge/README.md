@@ -34,6 +34,10 @@ conformance suite; the daemon sets everything explicitly).
   `session/resume` (or `session/load`) before its next prompt.
 - Requests on one process are serialized: two turns on one phone's primary
   process run one after the other.
+- `process_per_cwd(true)` (mfcli): agents that ignore the `cwd` of
+  `session/new` get one process per project, started in that directory
+  (key `<agent>:<node_id>@<cwd>`); requests are routed by the session's
+  project, and requests that name none use `$HOME`.
 
 ## Method mapping
 
