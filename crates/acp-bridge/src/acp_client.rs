@@ -132,9 +132,11 @@ pub struct AcpClient {
 
 impl AcpClient {
     /// Spawn a new ACP agent process and create a client for it.
+    /// `cwd` is the process working directory (`None`: the daemon's).
     pub async fn spawn(
         config: &AcpBridgeConfig,
         launcher: &Arc<dyn ProcessLauncher>,
+        cwd: Option<&std::path::Path>,
     ) -> Result<Self> {
         let args: Vec<OsString> = config
             .agent_args
@@ -151,7 +153,7 @@ impl AcpClient {
             program: config.agent_bin.clone(),
             args,
             role: ProcessRole::Agent,
-            cwd: None,
+            cwd: cwd.map(std::path::Path::to_path_buf),
             env: vec![],
             env_clear: false,
             stdin: StdioMode::Piped,

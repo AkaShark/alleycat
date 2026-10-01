@@ -13,6 +13,10 @@
 //! - `exit_after_prompts`: exit after this many completed prompts
 //! - `capabilities`: replaces the default `agentCapabilities`
 //! - `fail`: `{ "<method>": "<details>" }` answers that method with an error
+//! - `echo_cwd`: prompt replies `ok from <process cwd>` (mfcli works in its
+//!   process directory, whatever `session/new` says)
+//!
+//! `--spawn-log <path>` appends the process working directory on startup.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
@@ -27,6 +31,10 @@ fn main() {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or_else(|| json!({}));
+    if let Some(path) = arg(&args, "--spawn-log") {
+        let cwd = std::env::current_dir().expect("current dir");
+        append(&path, &cwd.display().to_string());
+    }
     let mut agent = FakeAgent::new(config);
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -285,9 +293,15 @@ impl FakeAgent {
                 if let Some(ms) = self.config.get("prompt_delay_ms").and_then(Value::as_u64) {
                     std::thread::sleep(Duration::from_millis(ms));
                 }
+                let text = if self.config.get("echo_cwd").and_then(Value::as_bool) == Some(true) {
+                    let cwd = std::env::current_dir().expect("current dir");
+                    format!("ok from {}", cwd.display())
+                } else {
+                    "ok".to_string()
+                };
                 update(
                     &session_id,
-                    json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok"}}),
+                    json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}),
                 );
                 ok(&id, json!({"stopReason": "end_turn"}));
                 self.prompts_done += 1;

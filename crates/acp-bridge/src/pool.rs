@@ -78,6 +78,16 @@ impl AcpPool {
     /// Get or create an ACP client for the given session.
     #[instrument(skip(self), fields(session_id = %session_id))]
     pub async fn get_client(&self, session_id: &str) -> Result<Arc<AcpClient>> {
+        self.get_client_in(session_id, None).await
+    }
+
+    /// Like [`get_client`](Self::get_client), but a newly spawned process
+    /// starts in `cwd`.
+    pub async fn get_client_in(
+        &self,
+        session_id: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Arc<AcpClient>> {
         if let Some(client) = self.live_client(session_id).await {
             return Ok(client);
         }
@@ -92,7 +102,7 @@ impl AcpPool {
         if let Some(client) = self.live_client(session_id).await {
             return Ok(client);
         }
-        self.spawn_client(session_id).await
+        self.spawn_client(session_id, cwd).await
     }
 
     /// The pooled client for `session_id` if its process is alive; a client
@@ -113,7 +123,11 @@ impl AcpPool {
         None
     }
 
-    async fn spawn_client(&self, session_id: &str) -> Result<Arc<AcpClient>> {
+    async fn spawn_client(
+        &self,
+        session_id: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Arc<AcpClient>> {
         debug!("Creating new ACP client for session");
 
         // Check pool capacity and evict idle clients if needed
@@ -129,7 +143,7 @@ impl AcpPool {
         }
 
         // Create new client
-        let client = Arc::new(AcpClient::spawn(&self.config, &self.launcher).await?);
+        let client = Arc::new(AcpClient::spawn(&self.config, &self.launcher, cwd).await?);
         let init_request = self
             .init_request
             .read()
@@ -172,6 +186,19 @@ impl AcpPool {
             if let Err(err) = entry.client.kill().await {
                 warn!(error = %err, "failed to kill ACP child while removing from pool");
             }
+        }
+    }
+
+    /// Remove every client whose key starts with `prefix`.
+    pub async fn remove_clients_with_prefix(&self, prefix: &str) {
+        let keys: Vec<String> = self
+            .clients
+            .iter()
+            .filter(|e| e.key().starts_with(prefix))
+            .map(|e| e.key().clone())
+            .collect();
+        for key in keys {
+            self.remove_client(&key).await;
         }
     }
 

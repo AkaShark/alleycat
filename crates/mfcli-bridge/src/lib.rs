@@ -1,9 +1,11 @@
 //! MyFlicker (`mfcli`) bridge: ACP over `mfcli acp`.
 //!
 //! All mfcli-specific behavior lives here; `acp-bridge` stays generic.
-//! - launch: `<bin> acp`, with the client advertising no fs/terminal
-//!   support (mfcli runs its own tools on this machine) and model
-//!   discovery enabled (mfcli does not persist prompt-less sessions);
+//! - launch: `<bin> acp`, one process per project directory (mfcli
+//!   ignores the `cwd` of `session/new` and works in its process
+//!   directory), with the client advertising no fs/terminal support (mfcli
+//!   runs its own tools) and model discovery enabled (mfcli does not
+//!   persist prompt-less sessions);
 //! - `thread/list`: mfcli's `session/list` needs a `cwd`, so the bridge
 //!   lists every known project (`~/.codeflicker/data.json` + its own cwd
 //!   index + the request's cwd) on the secondary process and merges;
@@ -96,7 +98,10 @@ impl MfcliBridge {
                 json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}),
             )
             .discover_models(true)
-            .pool_capacity(8)
+            // mfcli works in its process directory and ignores the cwd of
+            // `session/new`, so each project needs its own process.
+            .process_per_cwd(true)
+            .pool_capacity(16)
             .launcher(launcher)
             .build()
             .await

@@ -1,6 +1,6 @@
 //! `AcpBridge` — the unified `Bridge` impl for ACP-compliant agents.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +135,8 @@ pub struct AcpBridge {
     session_config: DashMap<String, Vec<Value>>,
     /// Fetch the model catalog from a throwaway session when empty.
     discover_models: bool,
+    /// One process per project directory (see the builder).
+    process_per_cwd: bool,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -190,9 +192,56 @@ impl AcpBridge {
     /// (`session/list`, model discovery) go here so they never queue
     /// behind a streaming `session/prompt` on the primary process.
     pub async fn ensure_aux_client(&self, ctx: &Conn) -> Result<Arc<crate::acp_client::AcpClient>> {
-        self.pool
-            .get_client(&format!("{}:aux", Self::session_key(ctx)))
-            .await
+        let key = Self::session_key(ctx);
+        if self.process_per_cwd {
+            let home = home_dir();
+            return self
+                .pool
+                .get_client_in(&format!("{key}@{home}:aux"), Some(Path::new(&home)))
+                .await;
+        }
+        self.pool.get_client(&format!("{key}:aux")).await
+    }
+
+    /// Project directory whose process should serve `method`, when the
+    /// bridge runs one process per project; `None` otherwise. Requests that
+    /// name no project go to `$HOME`, never `/`.
+    pub fn route_cwd(&self, method: &str, params: &Value) -> Option<String> {
+        if !self.process_per_cwd {
+            return None;
+        }
+        let param_cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|c| c.starts_with('/') && *c != "/")
+            .map(str::to_string);
+        let session_cwd = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .and_then(|id| self.session_cwd(id));
+        let cwd = match method {
+            "thread/start" => param_cwd,
+            "thread/resume" | "thread/fork" => param_cwd.or(session_cwd),
+            _ => session_cwd.or(param_cwd),
+        };
+        Some(cwd.unwrap_or_else(home_dir))
+    }
+
+    /// ACP process for this connection, in `cwd` when one is given.
+    pub async fn client_for(
+        &self,
+        ctx: &Conn,
+        cwd: Option<&str>,
+    ) -> Result<Arc<crate::acp_client::AcpClient>> {
+        let key = Self::session_key(ctx);
+        match cwd {
+            Some(cwd) => {
+                self.pool
+                    .get_client_in(&format!("{key}@{cwd}"), Some(Path::new(cwd)))
+                    .await
+            }
+            None => self.pool.get_client(&key).await,
+        }
     }
 
     /// Remember a session's ACP `configOptions` (and the model catalog in
@@ -232,7 +281,9 @@ impl AcpBridge {
     /// eviction would. The next request respawns it.
     #[doc(hidden)]
     pub async fn recycle_process(&self, ctx: &Conn) {
-        self.pool.remove_client(&Self::session_key(ctx)).await;
+        self.pool
+            .remove_clients_with_prefix(&Self::session_key(ctx))
+            .await;
     }
 
     /// Ensure an ACP client exists for the given session, creating one if needed.
@@ -538,6 +589,7 @@ pub struct AcpBridgeBuilder {
     enable_persistence: bool,
     client_capabilities: Option<Value>,
     discover_models: bool,
+    process_per_cwd: bool,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -555,6 +607,7 @@ impl Default for AcpBridgeBuilder {
             enable_persistence: false,
             client_capabilities: None,
             discover_models: false,
+            process_per_cwd: false,
         }
     }
 }
@@ -622,6 +675,14 @@ impl AcpBridgeBuilder {
     /// agents that do not persist prompt-less sessions (mfcli verified).
     pub fn discover_models(mut self, enabled: bool) -> Self {
         self.discover_models = enabled;
+        self
+    }
+
+    /// One ACP process per project directory, started in that directory,
+    /// for agents that ignore the `cwd` of `session/new` and work in their
+    /// process directory (mfcli). Off by default.
+    pub fn process_per_cwd(mut self, enabled: bool) -> Self {
+        self.process_per_cwd = enabled;
         self
     }
 
@@ -772,6 +833,7 @@ impl AcpBridgeBuilder {
             session_cwds: DashMap::new(),
             session_config: DashMap::new(),
             discover_models: self.discover_models,
+            process_per_cwd: self.process_per_cwd,
         }))
     }
 }
@@ -794,8 +856,9 @@ impl Bridge for AcpBridge {
         let request = crate::translate::codex_to_acp_initialize(&params, &self.client_capabilities)
             .map_err(|e| invalid_params(format!("Failed to translate initialize params: {e}")))?;
         self.pool.set_init_request(request.clone());
+        let cwd = self.route_cwd("initialize", &Value::Null);
         let client = self
-            .ensure_client(&Self::session_key(ctx))
+            .client_for(ctx, cwd.as_deref())
             .await
             .map_err(|e| internal(format!("Failed to create ACP client: {e}")))?;
         let response = handlers::handle_initialize(&client, &request).await?;
@@ -818,9 +881,9 @@ impl Bridge for AcpBridge {
     ) -> Result<Value, JsonRpcError> {
         debug!("Dispatching method: {}", method);
 
-        let session_key = Self::session_key(ctx);
+        let cwd = self.route_cwd(method, &params);
         let client = self
-            .ensure_client(&session_key)
+            .client_for(ctx, cwd.as_deref())
             .await
             .map_err(|e| JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
@@ -979,4 +1042,12 @@ impl Bridge for AcpBridge {
     async fn shutdown(&self) {
         AcpBridge::shutdown(self).await;
     }
+}
+
+/// `$HOME`, the directory for requests that name no project.
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| h.starts_with('/') && h != "/")
+        .unwrap_or_else(|| "/".to_string())
 }

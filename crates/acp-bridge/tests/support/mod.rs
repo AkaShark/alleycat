@@ -38,6 +38,7 @@ impl Harness {
         std::fs::write(&config_path, config.to_string()).expect("write config");
         std::fs::create_dir_all(dir.path().join("project")).expect("project dir");
         let log_path = dir.path().join("frames.jsonl");
+        let spawn_log = dir.path().join("spawns.log");
         let builder = AcpBridge::builder()
             .agent_bin(fake_agent_path())
             .agent_args(vec![
@@ -45,6 +46,8 @@ impl Harness {
                 log_path.display().to_string(),
                 "--config".into(),
                 config_path.display().to_string(),
+                "--spawn-log".into(),
+                spawn_log.display().to_string(),
             ]);
         let bridge = customize(builder).build().await.expect("build bridge");
         let session = Arc::new(Session::new("fake", "test-node".into(), 64, 1 << 20));
@@ -86,6 +89,26 @@ impl Harness {
         started["thread"]["id"]
             .as_str()
             .expect("thread id")
+            .to_string()
+    }
+
+    /// Working directory of every fake agent process spawned, in order.
+    pub fn spawned_cwds(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.path().join("spawns.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A fresh absolute directory under the harness tempdir, canonicalized
+    /// (macOS tempdirs live behind the /var → /private/var symlink).
+    pub fn make_dir(&self, name: &str) -> String {
+        let path = self.dir.path().join(name);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::canonicalize(&path)
+            .expect("canonicalize")
+            .display()
             .to_string()
     }
 
