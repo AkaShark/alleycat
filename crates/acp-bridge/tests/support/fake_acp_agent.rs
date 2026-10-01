@@ -15,6 +15,12 @@
 //! - `fail`: `{ "<method>": "<details>" }` answers that method with an error
 //! - `echo_cwd`: prompt replies `ok from <process cwd>` (mfcli works in its
 //!   process directory, whatever `session/new` says)
+//! - `models`: `[ {value, levels: [..]} ]` replaces the fixed model list;
+//!   each model offers its own `thought_level` values (none when `levels`
+//!   is empty) and switching model resets the level to `high` (or the
+//!   model's first level), as mfcli does
+//! - `default_thought`: a new session's level in `models` mode (default
+//!   `high`)
 //!
 //! `--spawn-log <path>` appends the process working directory on startup.
 
@@ -131,7 +137,53 @@ impl FakeAgent {
             .unwrap_or_else(|| default.to_string())
     }
 
+    fn per_model(&self) -> Option<&Vec<Value>> {
+        self.config.get("models").and_then(Value::as_array)
+    }
+
+    fn levels_for(&self, model: &str) -> Vec<String> {
+        self.per_model()
+            .into_iter()
+            .flatten()
+            .find(|m| m["value"] == model)
+            .and_then(|m| m["levels"].as_array())
+            .map(|l| {
+                l.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn per_model_options(&self, session_id: &str, models: &[Value]) -> Value {
+        let first = models[0]["value"].as_str().unwrap_or("").to_string();
+        let model = self.current(session_id, "model", &first);
+        let mut out = vec![json!({
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": model,
+            "options": models.iter().map(|m| json!({"name": m["value"], "value": m["value"]})).collect::<Vec<_>>(),
+        })];
+        let levels = self.levels_for(&model);
+        if !levels.is_empty() {
+            let default = self
+                .config
+                .get("default_thought")
+                .and_then(Value::as_str)
+                .unwrap_or("high");
+            out.push(json!({
+                "id": "thought_level", "name": "Thinking", "category": "thought_level", "type": "select",
+                "currentValue": self.current(session_id, "thought_level", default),
+                "options": levels.iter().map(|l| json!({"name": l, "value": l})).collect::<Vec<_>>(),
+            }));
+        }
+        Value::Array(out)
+    }
+
     fn config_options(&self, session_id: &str) -> Value {
+        if let Some(models) = self.per_model() {
+            return self.per_model_options(session_id, models);
+        }
         json!([
             {
                 "id": "model", "name": "Model", "category": "model", "type": "select",
@@ -277,10 +329,21 @@ impl FakeAgent {
                         &format!("invalid value {value} for {config_id}"),
                     );
                 }
-                self.session_config
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(config_id.to_string(), value.to_string());
+                let entry = self.session_config.entry(session_id.clone()).or_default();
+                entry.insert(config_id.to_string(), value.to_string());
+                if config_id == "model" && self.config.get("models").is_some() {
+                    let levels = self.levels_for(value);
+                    let reset = if levels.iter().any(|l| l == "high") {
+                        Some("high".to_string())
+                    } else {
+                        levels.first().cloned()
+                    };
+                    let entry = self.session_config.entry(session_id.clone()).or_default();
+                    match reset {
+                        Some(level) => entry.insert("thought_level".to_string(), level),
+                        None => entry.remove("thought_level"),
+                    };
+                }
                 ok(
                     &id,
                     json!({"configOptions": self.config_options(&session_id)}),

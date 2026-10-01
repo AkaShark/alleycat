@@ -133,8 +133,15 @@ pub struct AcpBridge {
     session_cwds: DashMap<String, String>,
     /// Latest ACP `configOptions` per session (model, thought_level, …).
     session_config: DashMap<String, Vec<Value>>,
+    /// `thought_level` option last seen for each model (`None`: the model
+    /// has no thinking levels). Agents such as mfcli offer different
+    /// levels per model.
+    model_levels: DashMap<String, Option<Value>>,
     /// Fetch the model catalog from a throwaway session when empty.
     discover_models: bool,
+    /// Whether model discovery has completed; held while it runs so
+    /// concurrent `model/list` calls do not walk the models twice.
+    model_discovery: tokio::sync::Mutex<bool>,
     /// One process per project directory (see the builder).
     process_per_cwd: bool,
 }
@@ -186,6 +193,11 @@ impl AcpBridge {
 
     pub fn discover_models_enabled(&self) -> bool {
         self.discover_models
+    }
+
+    /// Lock around model discovery; the value says whether it has run.
+    pub async fn model_discovery(&self) -> tokio::sync::MutexGuard<'_, bool> {
+        self.model_discovery.lock().await
     }
 
     /// Secondary ACP process for this connection. Read-only calls
@@ -259,7 +271,21 @@ impl AcpBridge {
         if !models.is_empty() {
             self.set_models(session_id, models);
         }
+        if let Some(model) =
+            crate::config_options::current_value(&options, crate::config_options::MODEL)
+        {
+            let levels =
+                crate::config_options::find(&options, crate::config_options::THOUGHT_LEVEL)
+                    .cloned();
+            self.model_levels.insert(model, levels);
+        }
         self.session_config.insert(session_id.to_string(), options);
+    }
+
+    /// `thought_level` option of `model`, if a response has shown that
+    /// model as current: `Some(None)` when it has no thinking levels.
+    pub fn model_levels(&self, model: &str) -> Option<Option<Value>> {
+        self.model_levels.get(model).map(|l| l.clone())
     }
 
     pub fn session_config(&self, session_id: &str) -> Vec<Value> {
@@ -832,7 +858,9 @@ impl AcpBridgeBuilder {
             agent_capabilities: std::sync::RwLock::new(Value::Null),
             session_cwds: DashMap::new(),
             session_config: DashMap::new(),
+            model_levels: DashMap::new(),
             discover_models: self.discover_models,
+            model_discovery: tokio::sync::Mutex::new(false),
             process_per_cwd: self.process_per_cwd,
         }))
     }

@@ -12,7 +12,12 @@
 //!   request's cwd) and merges;
 //! - `thread/start` / `thread/fork` / `thread/resume` / `turn/start`: keep
 //!   the cwd index current and give the generic bridge a session's real
-//!   cwd; an unknown cwd is an error, never a silent `/`.
+//!   cwd; an unknown cwd is an error, never a silent `/`;
+//! - model and thinking level: mfcli saves every `session/set_config_option`
+//!   as the user's default (`~/.codeflicker/config.json`, like `/model` in
+//!   its terminal UI), so choosing them on the phone also changes the
+//!   default of terminal `mfcli`. Model discovery switches back to where it
+//!   started.
 
 pub mod index;
 pub mod listing;

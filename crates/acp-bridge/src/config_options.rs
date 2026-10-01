@@ -42,47 +42,75 @@ pub fn values(options: &[Value], id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Codex reasoning effort → ACP `thought_level` value.
-pub fn thought_level_for(effort: p::ReasoningEffort) -> &'static str {
-    match effort {
+/// Codex reasoning effort → ACP `thought_level` value for a model that
+/// offers `offered`. The phone's top level is `xhigh`; on models whose top
+/// level is `max` (and that have no `xhigh`) it becomes `max`.
+pub fn thought_level_for(effort: p::ReasoningEffort, offered: &[String]) -> String {
+    let level = match effort {
         p::ReasoningEffort::None | p::ReasoningEffort::Minimal | p::ReasoningEffort::Low => "low",
         p::ReasoningEffort::Medium => "medium",
         p::ReasoningEffort::High => "high",
-        p::ReasoningEffort::XHigh | p::ReasoningEffort::Max => "xhigh",
-    }
+        p::ReasoningEffort::XHigh | p::ReasoningEffort::Max => {
+            let has = |v: &str| offered.iter().any(|o| o == v);
+            if !has("xhigh") && has("max") {
+                "max"
+            } else {
+                "xhigh"
+            }
+        }
+    };
+    level.to_string()
 }
 
-/// ACP `thought_level` value → codex reasoning effort.
+/// ACP `thought_level` value → codex reasoning effort. `max` maps to
+/// `xhigh`: the phone drops efforts it does not know, and it has no `max`.
 pub fn effort_for(level: &str) -> Option<p::ReasoningEffort> {
     match level {
         "low" => Some(p::ReasoningEffort::Low),
         "medium" => Some(p::ReasoningEffort::Medium),
         "high" => Some(p::ReasoningEffort::High),
-        "xhigh" => Some(p::ReasoningEffort::XHigh),
+        "xhigh" | "max" => Some(p::ReasoningEffort::XHigh),
         _ => None,
     }
 }
 
-/// `(configId, value)` pairs to send so the session matches the request.
-/// Values the agent does not offer are skipped (and logged): the turn
-/// runs with the agent's current value instead of failing.
-pub fn pending_changes(
-    options: &[Value],
-    model: Option<&str>,
-    effort: Option<p::ReasoningEffort>,
-) -> Vec<(&'static str, String)> {
-    let mut out = Vec::new();
-    if let Some(model) = model
-        && wants(options, MODEL, model)
-    {
-        out.push((MODEL, model.to_string()));
-    }
-    if let Some(effort) = effort
-        && wants(options, THOUGHT_LEVEL, thought_level_for(effort))
-    {
-        out.push((THOUGHT_LEVEL, thought_level_for(effort).to_string()));
-    }
-    out
+/// Codex efforts (with the agent's display names) for a `thought_level`
+/// option. `max` is left out when the model also offers `xhigh`, since
+/// both would map to the phone's `xhigh`.
+pub fn efforts_in(option: &Value) -> Vec<(p::ReasoningEffort, String)> {
+    let opts = option
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let has_xhigh = opts
+        .iter()
+        .any(|o| o.get("value").and_then(Value::as_str) == Some("xhigh"));
+    opts.iter()
+        .filter_map(|o| {
+            let value = o.get("value").and_then(Value::as_str)?;
+            if value == "max" && has_xhigh {
+                return None;
+            }
+            let name = o.get("name").and_then(Value::as_str).unwrap_or(value);
+            Some((effort_for(value)?, name.to_string()))
+        })
+        .collect()
+}
+
+/// Model to switch to so the session matches the request, if any. Values
+/// the agent does not offer are skipped (and logged): the turn runs with
+/// the agent's current value instead of failing.
+pub fn model_change(options: &[Value], model: Option<&str>) -> Option<String> {
+    let model = model?;
+    wants(options, MODEL, model).then(|| model.to_string())
+}
+
+/// Thinking level to switch to, checked against the levels the session's
+/// current model offers (so apply a model change first).
+pub fn effort_change(options: &[Value], effort: Option<p::ReasoningEffort>) -> Option<String> {
+    let level = thought_level_for(effort?, &values(options, THOUGHT_LEVEL));
+    wants(options, THOUGHT_LEVEL, &level).then_some(level)
 }
 
 fn wants(options: &[Value], id: &str, value: &str) -> bool {
@@ -115,6 +143,9 @@ mod tests {
     #[test]
     fn effort_maps_to_thought_level() {
         use p::ReasoningEffort as E;
+        let full: Vec<String> = ["low", "medium", "high", "xhigh"]
+            .map(String::from)
+            .to_vec();
         let cases = [
             (E::None, "low"),
             (E::Minimal, "low"),
@@ -125,25 +156,44 @@ mod tests {
             (E::Max, "xhigh"),
         ];
         for (effort, level) in cases {
-            assert_eq!(thought_level_for(effort), level, "{effort:?}");
+            assert_eq!(thought_level_for(effort, &full), level, "{effort:?}");
         }
+        let max_only: Vec<String> = ["high", "max"].map(String::from).to_vec();
+        assert_eq!(thought_level_for(E::XHigh, &max_only), "max");
+        let both: Vec<String> = ["high", "xhigh", "max"].map(String::from).to_vec();
+        assert_eq!(thought_level_for(E::XHigh, &both), "xhigh");
         assert_eq!(effort_for("xhigh"), Some(E::XHigh));
+        assert_eq!(effort_for("max"), Some(E::XHigh));
         assert_eq!(effort_for("turbo"), None);
     }
 
     #[test]
-    fn pending_changes_only_includes_allowed_differences() {
-        let opts = options();
-        assert!(pending_changes(&opts, Some("m/a"), Some(p::ReasoningEffort::Low)).is_empty());
+    fn efforts_in_folds_max_into_xhigh() {
+        use p::ReasoningEffort as E;
+        let max_only = json!({"options": [{"value": "high", "name": "High"}, {"value": "max", "name": "Max"}]});
         assert_eq!(
-            pending_changes(&opts, Some("m/b"), Some(p::ReasoningEffort::High)),
-            vec![
-                (MODEL, "m/b".to_string()),
-                (THOUGHT_LEVEL, "high".to_string())
-            ]
+            efforts_in(&max_only),
+            vec![(E::High, "High".to_string()), (E::XHigh, "Max".to_string())]
         );
-        assert!(pending_changes(&opts, Some("placeholder"), None).is_empty());
-        assert!(pending_changes(&[], Some("m/b"), Some(p::ReasoningEffort::High)).is_empty());
+        let both = json!({"options": [{"value": "xhigh"}, {"value": "max"}]});
+        assert_eq!(efforts_in(&both), vec![(E::XHigh, "xhigh".to_string())]);
+        assert!(efforts_in(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn changes_only_include_allowed_differences() {
+        let opts = options();
+        assert_eq!(model_change(&opts, Some("m/a")), None);
+        assert_eq!(model_change(&opts, Some("m/b")).as_deref(), Some("m/b"));
+        assert_eq!(model_change(&opts, Some("placeholder")), None);
+        assert_eq!(model_change(&[], Some("m/b")), None);
+        assert_eq!(effort_change(&opts, Some(p::ReasoningEffort::Low)), None);
+        assert_eq!(
+            effort_change(&opts, Some(p::ReasoningEffort::High)).as_deref(),
+            Some("high")
+        );
+        assert_eq!(effort_change(&[], Some(p::ReasoningEffort::High)), None);
+        assert_eq!(effort_change(&opts, None), None);
     }
 
     #[test]

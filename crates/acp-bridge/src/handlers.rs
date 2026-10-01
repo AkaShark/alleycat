@@ -66,8 +66,30 @@ pub fn handle_config_requirements_read() -> p::ConfigRequirementsReadResponse {
     p::ConfigRequirementsReadResponse { requirements: None }
 }
 
+/// Codex efforts and default effort for a `thought_level` option (`None`:
+/// the model has no thinking levels).
+fn effort_options(thought: Option<&Value>) -> (Vec<p::ReasoningEffortOption>, p::ReasoningEffort) {
+    let efforts = thought
+        .map(config_options::efforts_in)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(reasoning_effort, description)| p::ReasoningEffortOption {
+            reasoning_effort,
+            description,
+        })
+        .collect();
+    let default_effort = thought
+        .and_then(|t| t.get("currentValue"))
+        .and_then(Value::as_str)
+        .and_then(config_options::effort_for)
+        .unwrap_or(p::ReasoningEffort::Medium);
+    (efforts, default_effort)
+}
+
 /// Traits shared by every model of an ACP agent: thinking levels from the
 /// `thought_level` config option and image input from `initialize`.
+/// Models whose own levels are known (see `AcpBridge::model_levels`) use
+/// those instead.
 struct ModelTraits {
     efforts: Vec<p::ReasoningEffortOption>,
     default_effort: p::ReasoningEffort,
@@ -78,32 +100,7 @@ struct ModelTraits {
 impl ModelTraits {
     fn from_bridge(bridge: &crate::bridge::AcpBridge) -> Self {
         let thought = bridge.any_config_option(config_options::THOUGHT_LEVEL);
-        let mut efforts = Vec::new();
-        if let Some(opts) = thought
-            .as_ref()
-            .and_then(|t| t.get("options"))
-            .and_then(Value::as_array)
-        {
-            for opt in opts {
-                let value = opt.get("value").and_then(Value::as_str).unwrap_or("");
-                if let Some(effort) = config_options::effort_for(value) {
-                    efforts.push(p::ReasoningEffortOption {
-                        reasoning_effort: effort,
-                        description: opt
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or(value)
-                            .to_string(),
-                    });
-                }
-            }
-        }
-        let default_effort = thought
-            .as_ref()
-            .and_then(|t| t.get("currentValue"))
-            .and_then(Value::as_str)
-            .and_then(config_options::effort_for)
-            .unwrap_or(p::ReasoningEffort::Medium);
+        let (mut efforts, default_effort) = effort_options(thought.as_ref());
         if efforts.is_empty() {
             efforts.push(p::ReasoningEffortOption {
                 reasoning_effort: p::ReasoningEffort::Medium,
@@ -135,8 +132,9 @@ impl ModelTraits {
     }
 }
 
-/// Handle model/list. With discovery enabled and no catalog yet, fetch it
-/// from a throwaway session first; otherwise fall back to one placeholder
+/// Handle model/list. With discovery enabled, the first call fetches the
+/// catalog and every model's thinking levels from a throwaway session;
+/// without a catalog the list falls back to one placeholder
 /// named after the agent (e.g. `"devin"`) so the phone can pin a thread's
 /// `model` field to a real selection.
 pub async fn handle_model_list(
@@ -144,11 +142,16 @@ pub async fn handle_model_list(
     ctx: &alleycat_bridge_core::Conn,
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
-    if bridge.all_models().is_empty()
-        && bridge.discover_models_enabled()
-        && let Err(err) = discover_models(bridge, ctx).await
-    {
-        tracing::warn!(error = %err, "model discovery failed; returning placeholder");
+    if bridge.discover_models_enabled() {
+        // Runs once even when resumed threads already filled the catalog:
+        // their sessions only show the levels of their current model.
+        let mut done = bridge.model_discovery().await;
+        if !*done {
+            match discover_models(bridge, ctx).await {
+                Ok(()) => *done = true,
+                Err(err) => tracing::warn!(error = %err, "model discovery failed"),
+            }
+        }
     }
     let traits = ModelTraits::from_bridge(bridge);
     let cached = bridge.all_models();
@@ -166,6 +169,7 @@ pub async fn handle_model_list(
             &display_name,
             &description,
             &traits,
+            (traits.efforts.clone(), traits.default_effort),
             true,
         )]
     } else {
@@ -183,7 +187,11 @@ pub async fn handle_model_list(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let is_default = traits.default_model.as_deref() == Some(id);
-                model_record(id, name, description, &traits, is_default)
+                let efforts = match bridge.model_levels(id) {
+                    Some(levels) => effort_options(levels.as_ref()),
+                    None => (traits.efforts.clone(), traits.default_effort),
+                };
+                model_record(id, name, description, &traits, efforts, is_default)
             })
             .collect()
     };
@@ -207,7 +215,81 @@ async fn discover_models(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("session/new response missing sessionId"))?;
     bridge.record_session_config(session_id, &response);
+    discover_model_levels(bridge, &client, session_id).await;
     Ok(())
+}
+
+/// Switch the throwaway session through every model to learn each one's
+/// thinking levels, then back to the model and level it started with:
+/// mfcli saves every switch as the user's default.
+async fn discover_model_levels(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+) {
+    let options = bridge.session_config(session_id);
+    let Some(start_model) = config_options::current_value(&options, config_options::MODEL) else {
+        return;
+    };
+    let start_level = config_options::current_value(&options, config_options::THOUGHT_LEVEL);
+    let mut switched = false;
+    for model in config_options::values(&options, config_options::MODEL) {
+        if model == start_model || bridge.model_levels(&model).is_some() {
+            continue;
+        }
+        switched = true;
+        set_config(bridge, client, session_id, config_options::MODEL, &model).await;
+    }
+    if !switched {
+        return;
+    }
+    set_config(
+        bridge,
+        client,
+        session_id,
+        config_options::MODEL,
+        &start_model,
+    )
+    .await;
+    let now = bridge.session_config(session_id);
+    if let Some(level) = start_level
+        && config_options::current_value(&now, config_options::THOUGHT_LEVEL).as_deref()
+            != Some(level.as_str())
+    {
+        set_config(
+            bridge,
+            client,
+            session_id,
+            config_options::THOUGHT_LEVEL,
+            &level,
+        )
+        .await;
+    }
+}
+
+/// `session/set_config_option`, recording the returned config; failures
+/// are logged and leave the agent's current value in place.
+async fn set_config(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) {
+    let params = json!({"sessionId": session_id, "configId": config_id, "value": value});
+    match client
+        .send_request("session/set_config_option", params)
+        .await
+    {
+        Ok(response) => bridge.record_session_config(session_id, &response),
+        Err(err) => tracing::warn!(
+            session_id,
+            config_id,
+            value,
+            error = %err,
+            "set_config_option failed; continuing with the agent's current value"
+        ),
+    }
 }
 
 fn model_record(
@@ -215,6 +297,7 @@ fn model_record(
     name: &str,
     description: &str,
     traits: &ModelTraits,
+    (efforts, default_effort): (Vec<p::ReasoningEffortOption>, p::ReasoningEffort),
     is_default: bool,
 ) -> p::Model {
     p::Model {
@@ -226,8 +309,8 @@ fn model_record(
         display_name: name.to_string(),
         description: description.to_string(),
         hidden: false,
-        supported_reasoning_efforts: traits.efforts.clone(),
-        default_reasoning_effort: traits.default_effort,
+        supported_reasoning_efforts: efforts,
+        default_reasoning_effort: default_effort,
         input_modalities: traits.modalities.clone(),
         supports_personality: false,
         additional_speed_tiers: vec![],
@@ -1038,22 +1121,19 @@ pub async fn apply_session_config(
     model: Option<&str>,
     effort: Option<p::ReasoningEffort>,
 ) {
-    let options = bridge.session_config(session_id);
-    for (config_id, value) in config_options::pending_changes(&options, model, effort) {
-        let params = json!({"sessionId": session_id, "configId": config_id, "value": value});
-        match client
-            .send_request("session/set_config_option", params)
-            .await
-        {
-            Ok(response) => bridge.record_session_config(session_id, &response),
-            Err(err) => tracing::warn!(
-                session_id,
-                config_id,
-                value,
-                error = %err,
-                "set_config_option failed; continuing with the agent's current value"
-            ),
-        }
+    if let Some(model) = config_options::model_change(&bridge.session_config(session_id), model) {
+        set_config(bridge, client, session_id, config_options::MODEL, &model).await;
+    }
+    // Checked after the model switch: levels differ per model.
+    if let Some(level) = config_options::effort_change(&bridge.session_config(session_id), effort) {
+        set_config(
+            bridge,
+            client,
+            session_id,
+            config_options::THOUGHT_LEVEL,
+            &level,
+        )
+        .await;
     }
 }
 

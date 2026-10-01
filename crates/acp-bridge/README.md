@@ -47,9 +47,16 @@ conformance suite; the daemon sets everything explicitly).
 | `thread/start` | `session/new`, then `session/set_config_option` for a requested model |
 | `thread/resume` | `session/load` (history rebuilt from the replay) |
 | `thread/list` | `session/list` (with the request's `cwd`) on the secondary process |
-| `turn/start` | restore if needed, `session/set_config_option` for model / thinking level, streaming `session/prompt` |
+| `turn/start` | restore if needed, `session/set_config_option` for the model, then for the thinking level (checked against the new model's levels), streaming `session/prompt` |
 | `turn/interrupt` | `session/cancel` |
-| `model/list` | models from `configOptions[id=model]`, thinking levels from `configOptions[id=thought_level]` |
+| `model/list` | models from `configOptions[id=model]`; each model's thinking levels from its `configOptions[id=thought_level]` |
+
+Thinking levels can differ per model (mfcli). With `discover_models(true)`
+the first `model/list` switches a throwaway session through every model to
+learn each one's levels, then back to the model and level it started with.
+The phone has no `max` level (it drops levels it does not know), so an
+agent's `max` is offered as `xhigh`, and sent back as `max`, unless the model
+also has a real `xhigh`; then `max` is not offered.
 
 Permission requests (`session/request_permission`) are approved
 automatically. `turn/steer`, rollback, archive and review are not supported.
