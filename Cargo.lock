@@ -79,6 +79,7 @@ dependencies = [
  "alleycat-droid-bridge",
  "alleycat-grok-bridge",
  "alleycat-hermes-bridge",
+ "alleycat-mfcli-bridge",
  "alleycat-opencode-bridge",
  "alleycat-pi-bridge",
  "alleycat-shell-bridge",
@@ -321,6 +322,23 @@ dependencies = [
  "url",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "alleycat-mfcli-bridge"
+version = "0.1.0"
+dependencies = [
+ "alleycat-acp-bridge",
+ "alleycat-bridge-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

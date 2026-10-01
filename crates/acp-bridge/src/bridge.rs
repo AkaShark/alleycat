@@ -1,6 +1,6 @@
 //! `AcpBridge` — the unified `Bridge` impl for ACP-compliant agents.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,6 +124,27 @@ pub struct AcpBridge {
     /// it on `shutdown()` instead of relying on tokio runtime drop. Held
     /// in a `Mutex<Option<…>>` so `shutdown` can take it.
     eviction_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ACP `clientCapabilities` advertised in `initialize`.
+    client_capabilities: Value,
+    /// `agentCapabilities` from the agent's `initialize` response.
+    agent_capabilities: std::sync::RwLock<Value>,
+    /// Absolute cwd per session, recorded on thread/start, thread/resume
+    /// and turn/start; used to restore sessions in a respawned process.
+    session_cwds: DashMap<String, String>,
+    /// Latest ACP `configOptions` per session (model, thought_level, …).
+    session_config: DashMap<String, Vec<Value>>,
+    /// `thought_level` option last seen for each model (`None`: the model
+    /// has no thinking levels). Agents such as mfcli offer different
+    /// levels per model.
+    model_levels: DashMap<String, Option<Value>>,
+    /// Fetch the model catalog from a throwaway session when empty.
+    discover_models: bool,
+    /// Whether model discovery has completed. Discovery holds it for
+    /// writing; starting a session or switching its model holds it for
+    /// reading, since both touch the agent's saved default (mfcli).
+    model_discovery: tokio::sync::RwLock<bool>,
+    /// One process per project directory (see the builder).
+    process_per_cwd: bool,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -139,6 +160,168 @@ impl std::fmt::Debug for AcpBridge {
 impl AcpBridge {
     pub fn builder() -> AcpBridgeBuilder {
         AcpBridgeBuilder::default()
+    }
+
+    /// Pool key for the connection's primary ACP process.
+    pub fn session_key(ctx: &Conn) -> String {
+        let session = ctx.session();
+        format!("{}:{}", session.agent, session.node_id)
+    }
+
+    pub fn client_capabilities(&self) -> &Value {
+        &self.client_capabilities
+    }
+
+    pub fn agent_capabilities(&self) -> Value {
+        self.agent_capabilities
+            .read()
+            .expect("agent_capabilities poisoned")
+            .clone()
+    }
+
+    /// Record a session's cwd. `/` is the placeholder used when the real
+    /// cwd is unknown, so it is never recorded.
+    pub fn set_session_cwd(&self, session_id: &str, cwd: &str) {
+        if cwd.starts_with('/') && cwd != "/" {
+            self.session_cwds
+                .insert(session_id.to_string(), cwd.to_string());
+        }
+    }
+
+    pub fn session_cwd(&self, session_id: &str) -> Option<String> {
+        self.session_cwds.get(session_id).map(|c| c.clone())
+    }
+
+    pub fn discover_models_enabled(&self) -> bool {
+        self.discover_models
+    }
+
+    /// Exclusive lock for model discovery; the value says whether it ran.
+    pub async fn model_discovery(&self) -> tokio::sync::RwLockWriteGuard<'_, bool> {
+        self.model_discovery.write().await
+    }
+
+    /// Held while creating a session or applying a model / thinking level,
+    /// so neither runs while discovery walks the models. `None` when
+    /// discovery is off.
+    pub async fn config_guard(&self) -> Option<tokio::sync::RwLockReadGuard<'_, bool>> {
+        if self.discover_models {
+            Some(self.model_discovery.read().await)
+        } else {
+            None
+        }
+    }
+
+    /// Secondary ACP process for this connection. Read-only calls
+    /// (`session/list`, model discovery) go here so they never queue
+    /// behind a streaming `session/prompt` on the primary process.
+    pub async fn ensure_aux_client(&self, ctx: &Conn) -> Result<Arc<crate::acp_client::AcpClient>> {
+        let key = Self::session_key(ctx);
+        if self.process_per_cwd {
+            let home = home_dir();
+            return self
+                .pool
+                .get_client_in(&format!("{key}@{home}:aux"), Some(Path::new(&home)))
+                .await;
+        }
+        self.pool.get_client(&format!("{key}:aux")).await
+    }
+
+    /// Project directory whose process should serve `method`, when the
+    /// bridge runs one process per project; `None` otherwise. Requests that
+    /// name no project go to `$HOME`, never `/`.
+    pub fn route_cwd(&self, method: &str, params: &Value) -> Option<String> {
+        if !self.process_per_cwd {
+            return None;
+        }
+        let param_cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|c| c.starts_with('/') && *c != "/")
+            .map(str::to_string);
+        let session_cwd = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .and_then(|id| self.session_cwd(id));
+        let cwd = match method {
+            "thread/start" => param_cwd,
+            "thread/resume" | "thread/fork" => param_cwd.or(session_cwd),
+            _ => session_cwd.or(param_cwd),
+        };
+        Some(cwd.unwrap_or_else(home_dir))
+    }
+
+    /// ACP process for this connection, in `cwd` when one is given.
+    pub async fn client_for(
+        &self,
+        ctx: &Conn,
+        cwd: Option<&str>,
+    ) -> Result<Arc<crate::acp_client::AcpClient>> {
+        let key = Self::session_key(ctx);
+        match cwd {
+            Some(cwd) => {
+                self.pool
+                    .get_client_in(&format!("{key}@{cwd}"), Some(Path::new(cwd)))
+                    .await
+            }
+            None => self.pool.get_client(&key).await,
+        }
+    }
+
+    /// Remember a session's ACP `configOptions` (and the model catalog in
+    /// them) from any response that carries them.
+    pub fn record_session_config(&self, session_id: &str, response: &Value) {
+        let options = crate::config_options::extract(response);
+        if options.is_empty() {
+            return;
+        }
+        let models = crate::config_options::find(&options, crate::config_options::MODEL)
+            .and_then(|o| o.get("options"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !models.is_empty() {
+            self.set_models(session_id, models);
+        }
+        if let Some(model) =
+            crate::config_options::current_value(&options, crate::config_options::MODEL)
+        {
+            let levels =
+                crate::config_options::find(&options, crate::config_options::THOUGHT_LEVEL)
+                    .cloned();
+            self.model_levels.insert(model, levels);
+        }
+        self.session_config.insert(session_id.to_string(), options);
+    }
+
+    /// `thought_level` option of `model`, if a response has shown that
+    /// model as current: `Some(None)` when it has no thinking levels.
+    pub fn model_levels(&self, model: &str) -> Option<Option<Value>> {
+        self.model_levels.get(model).map(|l| l.clone())
+    }
+
+    pub fn session_config(&self, session_id: &str) -> Vec<Value> {
+        self.session_config
+            .get(session_id)
+            .map(|o| o.clone())
+            .unwrap_or_default()
+    }
+
+    /// First session's option with this id (agent-wide traits such as the
+    /// thinking levels are the same for every session).
+    pub fn any_config_option(&self, id: &str) -> Option<Value> {
+        self.session_config
+            .iter()
+            .find_map(|entry| crate::config_options::find(entry.value(), id).cloned())
+    }
+
+    /// Test hook: kill this connection's primary ACP process, as idle
+    /// eviction would. The next request respawns it.
+    #[doc(hidden)]
+    pub async fn recycle_process(&self, ctx: &Conn) {
+        self.pool
+            .remove_clients_with_prefix(&Self::session_key(ctx))
+            .await;
     }
 
     /// Ensure an ACP client exists for the given session, creating one if needed.
@@ -442,6 +625,9 @@ pub struct AcpBridgeBuilder {
     retry_backoff: Option<Duration>,
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
+    client_capabilities: Option<Value>,
+    discover_models: bool,
+    process_per_cwd: bool,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -457,6 +643,9 @@ impl Default for AcpBridgeBuilder {
             retry_backoff: None,
             state_dir: None,
             enable_persistence: false,
+            client_capabilities: None,
+            discover_models: false,
+            process_per_cwd: false,
         }
     }
 }
@@ -509,6 +698,29 @@ impl AcpBridgeBuilder {
 
     pub fn enable_persistence(mut self, enabled: bool) -> Self {
         self.enable_persistence = enabled;
+        self
+    }
+
+    /// ACP `clientCapabilities` to advertise in `initialize`. Defaults to
+    /// `translate::default_client_capabilities()`.
+    pub fn client_capabilities(mut self, caps: Value) -> Self {
+        self.client_capabilities = Some(caps);
+        self
+    }
+
+    /// When the model catalog is empty, `model/list` creates a throwaway
+    /// session in `$HOME` on the secondary process to fetch it. Only for
+    /// agents that do not persist prompt-less sessions (mfcli verified).
+    pub fn discover_models(mut self, enabled: bool) -> Self {
+        self.discover_models = enabled;
+        self
+    }
+
+    /// One ACP process per project directory, started in that directory,
+    /// for agents that ignore the `cwd` of `session/new` and work in their
+    /// process directory (mfcli). Off by default.
+    pub fn process_per_cwd(mut self, enabled: bool) -> Self {
+        self.process_per_cwd = enabled;
         self
     }
 
@@ -595,8 +807,7 @@ impl AcpBridgeBuilder {
             request_timeout_secs: self.request_timeout.map(|d| d.as_secs()),
             max_retries: self.max_retries,
             retry_backoff_ms: self.retry_backoff.map(|d| d.as_millis() as u64),
-        }
-        .from_env();
+        };
 
         // Extract state_dir before moving config
         let state_dir_for_persistence = config.state_dir.clone();
@@ -653,6 +864,16 @@ impl AcpBridgeBuilder {
             thread_titles: DashMap::new(),
             persistence,
             eviction_handle: std::sync::Mutex::new(Some(eviction_handle)),
+            client_capabilities: self
+                .client_capabilities
+                .unwrap_or_else(crate::translate::default_client_capabilities),
+            agent_capabilities: std::sync::RwLock::new(Value::Null),
+            session_cwds: DashMap::new(),
+            session_config: DashMap::new(),
+            model_levels: DashMap::new(),
+            discover_models: self.discover_models,
+            model_discovery: tokio::sync::RwLock::new(false),
+            process_per_cwd: self.process_per_cwd,
         }))
     }
 }
@@ -672,18 +893,24 @@ impl AcpBridge {
 #[async_trait]
 impl Bridge for AcpBridge {
     async fn initialize(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let session = ctx.session();
-        let session_key = format!("{}:{}", session.agent, session.node_id);
+        let request = crate::translate::codex_to_acp_initialize(&params, &self.client_capabilities)
+            .map_err(|e| invalid_params(format!("Failed to translate initialize params: {e}")))?;
+        self.pool.set_init_request(request.clone());
+        let cwd = self.route_cwd("initialize", &Value::Null);
         let client = self
-            .ensure_client(&session_key)
+            .client_for(ctx, cwd.as_deref())
             .await
-            .map_err(|e| JsonRpcError {
-                code: error_codes::INTERNAL_ERROR,
-                message: format!("Failed to create ACP client: {}", e),
-                data: None,
-            })?;
-
-        handlers::handle_initialize(&client, params).await
+            .map_err(|e| internal(format!("Failed to create ACP client: {e}")))?;
+        let response = handlers::handle_initialize(&client, &request).await?;
+        *self
+            .agent_capabilities
+            .write()
+            .expect("agent_capabilities poisoned") = response
+            .get("agentCapabilities")
+            .cloned()
+            .unwrap_or(Value::Null);
+        crate::translate::acp_to_codex_initialize_result(&response)
+            .map_err(|e| internal(format!("Failed to translate initialize response: {e}")))
     }
 
     async fn dispatch(
@@ -694,10 +921,9 @@ impl Bridge for AcpBridge {
     ) -> Result<Value, JsonRpcError> {
         debug!("Dispatching method: {}", method);
 
-        let session = ctx.session();
-        let session_key = format!("{}:{}", session.agent, session.node_id);
+        let cwd = self.route_cwd(method, &params);
         let client = self
-            .ensure_client(&session_key)
+            .client_for(ctx, cwd.as_deref())
             .await
             .map_err(|e| JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
@@ -731,11 +957,7 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                to_value(handlers::handle_model_list(
-                    self,
-                    &ctx.session().agent,
-                    typed,
-                ))
+                to_value(handlers::handle_model_list(self, ctx, typed).await)
             }
             "experimentalFeature/list" => to_value(handlers::handle_experimental_feature_list()),
             "collaborationMode/list" => to_value(handlers::handle_collaboration_mode_list(self)),
@@ -762,7 +984,11 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                handlers::handle_thread_list(&client, typed).await
+                let aux = self
+                    .ensure_aux_client(ctx)
+                    .await
+                    .map_err(|e| internal(format!("Failed to get ACP client: {e}")))?;
+                handlers::handle_thread_list(&aux, typed).await
             }
             "thread/start" => handlers::handle_thread_start(ctx, self, &client, params).await,
             "thread/resume" => handlers::handle_thread_resume(ctx, self, &client, params).await,
@@ -771,7 +997,7 @@ impl Bridge for AcpBridge {
                 let typed: p::ThreadSetNameParams = decode(params)?;
                 to_value(handlers::handle_thread_name_set(ctx, self, typed))
             }
-            "thread/fork" => handlers::handle_thread_fork(ctx, &client, params).await,
+            "thread/fork" => handlers::handle_thread_fork(ctx, self, &client, params).await,
             "thread/rollback" => {
                 let typed: p::ThreadRollbackParams = decode(params)?;
                 handlers::handle_thread_rollback(typed)
@@ -856,4 +1082,12 @@ impl Bridge for AcpBridge {
     async fn shutdown(&self) {
         AcpBridge::shutdown(self).await;
     }
+}
+
+/// `$HOME`, the directory for requests that name no project.
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| h.starts_with('/') && h != "/")
+        .unwrap_or_else(|| "/".to_string())
 }

@@ -29,11 +29,11 @@
 //!   so iOS sees the assistant text and tool bubbles appear in real
 //!   time instead of all at once at the end of the turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alleycat_bridge_core::{ChildProcess, ProcessLauncher, ProcessRole, ProcessSpec, StdioMode};
 use anyhow::Result;
@@ -119,13 +119,24 @@ pub struct AcpClient {
     /// JoinHandle for the background reader so we can abort it on
     /// `kill()` instead of leaking the task.
     reader_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Set by the reader task when the agent's stdout closes (the process
+    /// exited or crashed). The pool drops closed clients and respawns.
+    closed: Arc<AtomicBool>,
+    /// Cached ACP `initialize` result for this process.
+    initialized: Mutex<Option<Value>>,
+    /// Sessions this process has created, loaded or resumed. ACP agents
+    /// keep sessions per process, so a respawned process must restore a
+    /// session before it can be prompted.
+    loaded_sessions: std::sync::Mutex<HashSet<String>>,
 }
 
 impl AcpClient {
     /// Spawn a new ACP agent process and create a client for it.
+    /// `cwd` is the process working directory (`None`: the daemon's).
     pub async fn spawn(
         config: &AcpBridgeConfig,
         launcher: &Arc<dyn ProcessLauncher>,
+        cwd: Option<&std::path::Path>,
     ) -> Result<Self> {
         let args: Vec<OsString> = config
             .agent_args
@@ -142,7 +153,7 @@ impl AcpClient {
             program: config.agent_bin.clone(),
             args,
             role: ProcessRole::Agent,
-            cwd: None,
+            cwd: cwd.map(std::path::Path::to_path_buf),
             env: vec![],
             env_clear: false,
             stdin: StdioMode::Piped,
@@ -164,8 +175,16 @@ impl AcpClient {
         let stdin = Arc::new(Mutex::new(stdin));
         let reader_inner = Arc::clone(&inner);
         let reader_stdin = Arc::clone(&stdin);
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader_closed = Arc::clone(&closed);
         let handle = tokio::spawn(async move {
-            reader_task(BufReader::new(stdout), reader_inner, reader_stdin).await;
+            reader_task(
+                BufReader::new(stdout),
+                reader_inner,
+                reader_stdin,
+                reader_closed,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -174,7 +193,41 @@ impl AcpClient {
             inner,
             request_lock: Arc::new(Mutex::new(())),
             reader_handle: Arc::new(Mutex::new(Some(handle))),
+            closed,
+            initialized: Mutex::new(None),
+            loaded_sessions: std::sync::Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Send ACP `initialize` once per process; later calls return the
+    /// cached result (a phone reconnecting to a live process must not
+    /// re-initialize it).
+    pub async fn ensure_initialized(&self, request: &Value) -> Result<Value> {
+        let mut guard = self.initialized.lock().await;
+        if let Some(result) = guard.as_ref() {
+            return Ok(result.clone());
+        }
+        let result = self.send_request("initialize", request.clone()).await?;
+        *guard = Some(result.clone());
+        Ok(result)
+    }
+
+    pub fn mark_session_loaded(&self, session_id: &str) {
+        self.loaded_sessions
+            .lock()
+            .expect("loaded_sessions poisoned")
+            .insert(session_id.to_string());
+    }
+
+    pub fn is_session_loaded(&self, session_id: &str) -> bool {
+        self.loaded_sessions
+            .lock()
+            .expect("loaded_sessions poisoned")
+            .contains(session_id)
     }
 
     /// Drain notifications buffered since the last call. Kept for
@@ -294,13 +347,19 @@ impl AcpClient {
 
         if let Some(error) = response.get("error") {
             error!(?error, "ACP agent returned error");
-            // Surface just the human-readable `message` so callers (and
-            // ultimately the iOS error toast) see a clean line.
+            // Surface the human-readable `message`, plus `data.details`
+            // when the agent puts the real reason there (mfcli always
+            // answers `Internal error` and explains in `details`).
             let message = error
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ACP agent returned an error");
-            anyhow::bail!("{message}");
+            match error.pointer("/data/details").and_then(|v| v.as_str()) {
+                Some(details) if !details.is_empty() && details != message => {
+                    anyhow::bail!("{message}: {details}")
+                }
+                _ => anyhow::bail!("{message}"),
+            }
         }
 
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
@@ -326,9 +385,25 @@ impl AcpClient {
     }
 
     /// Kill the underlying agent process and abort the reader task.
+    /// True while a request is in flight on this process (e.g. a
+    /// streaming `session/prompt`).
+    pub fn is_busy(&self) -> bool {
+        self.request_lock.try_lock().is_err()
+    }
+
     pub async fn kill(&self) -> Result<()> {
         if let Some(handle) = self.reader_handle.lock().await.take() {
             handle.abort();
+        }
+        // The aborted reader can no longer answer outstanding requests;
+        // fail them now so callers don't wait forever.
+        self.closed.store(true, Ordering::SeqCst);
+        for (_id, tx) in self.inner.pending.lock().await.drain() {
+            let _ = tx.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32000, "message": "ACP agent process was stopped"},
+            }));
         }
         let mut process = self.process.lock().await;
         process
@@ -344,6 +419,7 @@ async fn reader_task(
     mut reader: BufReader<alleycat_bridge_core::ChildStdout>,
     inner: Arc<Inner>,
     stdin: Arc<Mutex<alleycat_bridge_core::ChildStdin>>,
+    closed: Arc<AtomicBool>,
 ) {
     loop {
         let mut line = String::new();
@@ -379,6 +455,7 @@ async fn reader_task(
             }
         }
     }
+    closed.store(true, Ordering::SeqCst);
     // Wake up any outstanding request so callers don't hang forever.
     let mut pending = inner.pending.lock().await;
     for (_id, tx) in pending.drain() {

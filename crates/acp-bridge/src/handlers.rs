@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, instrument};
 
 use crate::acp_client::AcpClient;
+use crate::config_options;
 use crate::translate;
 
 /// ACP `session/new` and `session/load` require `cwd` to be an absolute
@@ -22,31 +23,20 @@ fn coerce_absolute_cwd(cwd: Option<&str>) -> &str {
     }
 }
 
-/// Handle initialize request.
+/// Initialize the process behind `client` (once) and return the raw ACP
+/// `initialize` response.
 pub async fn handle_initialize(
     client: &Arc<AcpClient>,
-    params: Value,
+    acp_request: &Value,
 ) -> Result<Value, JsonRpcError> {
-    let acp_request = translate::codex_to_acp_initialize(&params).map_err(|e| JsonRpcError {
-        code: error_codes::INVALID_PARAMS,
-        message: format!("Failed to translate initialize params: {}", e),
-        data: None,
-    })?;
-
-    let acp_response = client
-        .send_request("initialize", acp_request)
+    client
+        .ensure_initialized(acp_request)
         .await
         .map_err(|e| JsonRpcError {
             code: error_codes::INTERNAL_ERROR,
             message: format!("Failed to send initialize to ACP agent: {}", e),
             data: None,
-        })?;
-
-    translate::acp_to_codex_initialize_result(&acp_response).map_err(|e| JsonRpcError {
-        code: error_codes::INTERNAL_ERROR,
-        message: format!("Failed to translate initialize response: {}", e),
-        data: None,
-    })
+        })
 }
 
 /// Handle account/read request.
@@ -76,100 +66,275 @@ pub fn handle_config_requirements_read() -> p::ConfigRequirementsReadResponse {
     p::ConfigRequirementsReadResponse { requirements: None }
 }
 
-/// Handle model/list request. `agent_id` is the wire name of the agent
-/// this connection is bound to (e.g. `"devin"`), pulled from the iroh
-/// session — without it every ACP-backed agent would advertise the same
-/// `"acp-default"` model and the iOS picker would have no way to match
-/// the thread's `model` field against a real selection. Using the agent
-/// id keeps every ACP agent self-identifying while staying generic.
-pub fn handle_model_list(
+/// Codex efforts and default effort for a `thought_level` option (`None`:
+/// the model has no thinking levels).
+fn effort_options(thought: Option<&Value>) -> (Vec<p::ReasoningEffortOption>, p::ReasoningEffort) {
+    let efforts = thought
+        .map(config_options::efforts_in)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(reasoning_effort, description)| p::ReasoningEffortOption {
+            reasoning_effort,
+            description,
+        })
+        .collect();
+    let default_effort = thought
+        .and_then(|t| t.get("currentValue"))
+        .and_then(Value::as_str)
+        .and_then(config_options::effort_for)
+        .unwrap_or(p::ReasoningEffort::Medium);
+    (efforts, default_effort)
+}
+
+/// Traits shared by every model of an ACP agent: thinking levels from the
+/// `thought_level` config option and image input from `initialize`.
+/// Models whose own levels are known (see `AcpBridge::model_levels`) use
+/// those instead.
+struct ModelTraits {
+    efforts: Vec<p::ReasoningEffortOption>,
+    default_effort: p::ReasoningEffort,
+    modalities: Vec<Value>,
+    default_model: Option<String>,
+}
+
+impl ModelTraits {
+    fn from_bridge(bridge: &crate::bridge::AcpBridge) -> Self {
+        let thought = bridge.any_config_option(config_options::THOUGHT_LEVEL);
+        let (mut efforts, default_effort) = effort_options(thought.as_ref());
+        if efforts.is_empty() {
+            efforts.push(p::ReasoningEffortOption {
+                reasoning_effort: p::ReasoningEffort::Medium,
+                description: "Default".to_string(),
+            });
+        }
+        let image = bridge
+            .agent_capabilities()
+            .pointer("/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut modalities = vec![json!("text")];
+        if image {
+            modalities.push(json!("image"));
+        }
+        let default_model = bridge
+            .any_config_option(config_options::MODEL)
+            .and_then(|m| {
+                m.get("currentValue")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        Self {
+            efforts,
+            default_effort,
+            modalities,
+            default_model,
+        }
+    }
+}
+
+/// Handle model/list. With discovery enabled, the first call fetches the
+/// catalog and every model's thinking levels from a throwaway session;
+/// without a catalog the list falls back to one placeholder
+/// named after the agent (e.g. `"devin"`) so the phone can pin a thread's
+/// `model` field to a real selection.
+pub async fn handle_model_list(
     bridge: &crate::bridge::AcpBridge,
-    agent_id: &str,
+    ctx: &alleycat_bridge_core::Conn,
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
-    let cached = bridge.all_models();
-    if !cached.is_empty() {
-        let data: Vec<p::Model> = cached.iter().map(|m| acp_model_to_codex(m)).collect();
-        return p::ModelListResponse {
-            data,
-            next_cursor: None,
-        };
+    if bridge.discover_models_enabled() {
+        // Runs once even when resumed threads already filled the catalog:
+        // their sessions only show the levels of their current model.
+        let mut done = bridge.model_discovery().await;
+        if !*done {
+            match tokio::time::timeout(MODEL_DISCOVERY_TIMEOUT, discover_models(bridge, ctx)).await
+            {
+                Ok(Ok(())) => *done = true,
+                Ok(Err(err)) => tracing::warn!(error = %err, "model discovery failed"),
+                Err(_) => {
+                    // Not retried: a hung agent would stall every model/list.
+                    tracing::warn!("model discovery timed out");
+                    *done = true;
+                }
+            }
+        }
     }
-    // Fallback: agent hasn't yet started a session so we have no
-    // catalog. Return a single placeholder so the iOS picker has at
-    // least one entry it can pin the active thread to.
-    let id = if agent_id.is_empty() {
-        "acp-default".to_string()
+    let traits = ModelTraits::from_bridge(bridge);
+    let cached = bridge.all_models();
+    let data: Vec<p::Model> = if cached.is_empty() {
+        let agent_id = ctx.session().agent.to_string();
+        let id = if agent_id.is_empty() {
+            "acp-default".to_string()
+        } else {
+            agent_id
+        };
+        let display_name = title_case(&id);
+        let description = format!("Default model for {display_name}");
+        vec![model_record(
+            &id,
+            &display_name,
+            &description,
+            &traits,
+            (traits.efforts.clone(), traits.default_effort),
+            true,
+        )]
     } else {
-        agent_id.to_string()
+        cached
+            .iter()
+            .map(|entry| {
+                let id = entry
+                    .get("value")
+                    .or_else(|| entry.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let name = entry.get("name").and_then(Value::as_str).unwrap_or(id);
+                let description = entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let is_default = traits.default_model.as_deref() == Some(id);
+                // Per-model levels only for agents that discover them; the
+                // others keep one set of levels for every model.
+                let levels = bridge
+                    .discover_models_enabled()
+                    .then(|| bridge.model_levels(id))
+                    .flatten();
+                let efforts = match levels {
+                    Some(levels) => effort_options(levels.as_ref()),
+                    None => (traits.efforts.clone(), traits.default_effort),
+                };
+                model_record(id, name, description, &traits, efforts, is_default)
+            })
+            .collect()
     };
-    let display_name = title_case(&id);
-    let data = vec![p::Model {
-        id: id.clone(),
-        model: id,
-        upgrade: None,
-        upgrade_info: None,
-        availability_nux: None,
-        display_name: display_name.clone(),
-        description: format!("Default model for {display_name}"),
-        hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
-        input_modalities: vec![json!("text")],
-        supports_personality: false,
-        additional_speed_tiers: vec![],
-        service_tiers: vec![p::ModelServiceTier {
-            id: "standard".to_string(),
-            name: "Standard".to_string(),
-            description: "Standard service tier".to_string(),
-        }],
-        is_default: true,
-    }];
     p::ModelListResponse {
         data,
         next_cursor: None,
     }
 }
 
-/// Translate an ACP `configOptions[id=model].options[]` entry into
-/// codex `Model`. ACP exposes only `value` (the model id) + `name` (the
-/// display label); reasoning effort is implied by the model id (e.g.
-/// `claude-opus-4-7-high` vs `-low`) so we don't try to infer it.
-fn acp_model_to_codex(entry: &Value) -> p::Model {
-    let id = entry
-        .get("value")
-        .or_else(|| entry.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let display_name = entry
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(id.as_str())
-        .to_string();
-    let description = entry
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+/// Upper bound for model discovery (it switches through every model once).
+const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn discover_models(
+    bridge: &crate::bridge::AcpBridge,
+    ctx: &alleycat_bridge_core::Conn,
+) -> anyhow::Result<()> {
+    let client = bridge.ensure_aux_client(ctx).await?;
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let response = client
+        .send_request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await?;
+    let session_id = response
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("session/new response missing sessionId"))?;
+    bridge.record_session_config(session_id, &response);
+    discover_model_levels(bridge, &client, session_id).await;
+    Ok(())
+}
+
+/// Switch the throwaway session through every model to learn each one's
+/// thinking levels, then back to the model and level it started with:
+/// mfcli saves every switch as the user's default.
+async fn discover_model_levels(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+) {
+    let options = bridge.session_config(session_id);
+    let Some(start_model) = config_options::current_value(&options, config_options::MODEL) else {
+        return;
+    };
+    let start_level = config_options::current_value(&options, config_options::THOUGHT_LEVEL);
+    let mut switched = false;
+    for model in config_options::values(&options, config_options::MODEL) {
+        if model == start_model || bridge.model_levels(&model).is_some() {
+            continue;
+        }
+        switched = true;
+        set_config(bridge, client, session_id, config_options::MODEL, &model).await;
+    }
+    if !switched {
+        return;
+    }
+    set_config(
+        bridge,
+        client,
+        session_id,
+        config_options::MODEL,
+        &start_model,
+    )
+    .await;
+    let now = bridge.session_config(session_id);
+    if config_options::current_value(&now, config_options::MODEL).as_deref()
+        != Some(start_model.as_str())
+    {
+        tracing::error!(
+            model = %start_model,
+            "model discovery could not switch back; the agent's saved default model may have changed"
+        );
+    }
+    if let Some(level) = start_level
+        && config_options::current_value(&now, config_options::THOUGHT_LEVEL).as_deref()
+            != Some(level.as_str())
+    {
+        set_config(
+            bridge,
+            client,
+            session_id,
+            config_options::THOUGHT_LEVEL,
+            &level,
+        )
+        .await;
+    }
+}
+
+/// `session/set_config_option`, recording the returned config; failures
+/// are logged and leave the agent's current value in place.
+async fn set_config(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) {
+    let params = json!({"sessionId": session_id, "configId": config_id, "value": value});
+    match client
+        .send_request("session/set_config_option", params)
+        .await
+    {
+        Ok(response) => bridge.record_session_config(session_id, &response),
+        Err(err) => tracing::warn!(
+            session_id,
+            config_id,
+            value,
+            error = %err,
+            "set_config_option failed; continuing with the agent's current value"
+        ),
+    }
+}
+
+fn model_record(
+    id: &str,
+    name: &str,
+    description: &str,
+    traits: &ModelTraits,
+    (efforts, default_effort): (Vec<p::ReasoningEffortOption>, p::ReasoningEffort),
+    is_default: bool,
+) -> p::Model {
     p::Model {
-        id: id.clone(),
-        model: id,
+        id: id.to_string(),
+        model: id.to_string(),
         upgrade: None,
         upgrade_info: None,
         availability_nux: None,
-        display_name,
-        description,
+        display_name: name.to_string(),
+        description: description.to_string(),
         hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
-        input_modalities: vec![json!("text")],
+        supported_reasoning_efforts: efforts,
+        default_reasoning_effort: default_effort,
+        input_modalities: traits.modalities.clone(),
         supports_personality: false,
         additional_speed_tiers: vec![],
         service_tiers: vec![p::ModelServiceTier {
@@ -177,28 +342,8 @@ fn acp_model_to_codex(entry: &Value) -> p::Model {
             name: "Standard".to_string(),
             description: "Standard service tier".to_string(),
         }],
-        is_default: false,
+        is_default,
     }
-}
-
-/// Pull the `options` array out of `session/new`'s `configOptions[id=model]`.
-/// Returns the raw ACP entries so the bridge can dedupe and we keep
-/// translation in one place.
-pub(crate) fn extract_models_from_config_options(session_new: &Value) -> Vec<Value> {
-    let options = session_new
-        .get("configOptions")
-        .and_then(|v| v.as_array())
-        .map(|v| v.iter())
-        .into_iter()
-        .flatten();
-    for opt in options {
-        if opt.get("id").and_then(|v| v.as_str()) == Some("model") {
-            if let Some(arr) = opt.get("options").and_then(|v| v.as_array()) {
-                return arr.clone();
-            }
-        }
-    }
-    Vec::new()
 }
 
 /// Pull `modes.currentModeId` and `modes.availableModes` out of
@@ -339,6 +484,14 @@ pub async fn handle_thread_start(
             data: None,
         })?;
 
+    let sent_cwd = acp_request
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("/")
+        .to_string();
+    // Until the requested model is applied: a new session starts on the
+    // agent's saved default, which model discovery rewrites while it runs.
+    let config_guard = bridge.config_guard().await;
     let acp_response = client
         .send_request("session/new", acp_request)
         .await
@@ -357,16 +510,17 @@ pub async fn handle_thread_start(
             data: None,
         })?
         .to_string();
+    client.mark_session_loaded(&session_id);
+    bridge.set_session_cwd(&session_id, &sent_cwd);
 
     // Capture models + modes advertised by `session/new`. ACP doesn't
     // have dedicated model_list / mode_list methods — both arrive as
     // entries in `configOptions[]`. We stash the parsed shapes per
     // session so `model/list` and `collaborationMode/list` can serve
     // real data instead of placeholder rows.
-    let models = extract_models_from_config_options(&acp_response);
-    if !models.is_empty() {
-        bridge.set_models(&session_id, models);
-    }
+    bridge.record_session_config(&session_id, &acp_response);
+    apply_session_config(bridge, client, &session_id, typed.model.as_deref(), None).await;
+    drop(config_guard);
     let modes = extract_modes_from_session_new(&acp_response);
     if modes.current.is_some() || !modes.available.is_empty() {
         bridge.set_modes(&session_id, modes);
@@ -397,7 +551,7 @@ pub async fn handle_thread_start(
             "agentRole": null,
             "turns": [],
         },
-        "model": &agent_id,
+        "model": reported_model(bridge, &session_id, &agent_id),
         "modelProvider": &agent_id,
         "cwd": cwd,
         "approvalPolicy": "on-request",
@@ -409,10 +563,15 @@ pub async fn handle_thread_start(
 /// Handle thread/list request.
 pub async fn handle_thread_list(
     client: &Arc<AcpClient>,
-    _params: p::ThreadListParams,
+    params: p::ThreadListParams,
 ) -> Result<Value, JsonRpcError> {
+    // Agents such as mfcli only list sessions for a given cwd.
+    let request = match params.cwd.as_ref().and_then(Value::as_str) {
+        Some(cwd) if cwd.starts_with('/') => json!({"cwd": cwd}),
+        _ => json!({}),
+    };
     // Try to use ACP's session/list if available
-    match client.send_request("session/list", json!({})).await {
+    match client.send_request("session/list", request).await {
         Ok(acp_response) => {
             // Parse ACP session list response
             let empty_sessions = vec![];
@@ -444,7 +603,7 @@ pub async fn handle_thread_list(
                         "updatedAt": updated_at,
                         "status": { "type": "idle" },
                         "path": "",
-                        "cwd": "",
+                        "cwd": session.get("cwd").and_then(|v| v.as_str()).unwrap_or(""),
                         "cliVersion": "",
                         "source": "appServer",
                         "threadSource": null,
@@ -516,13 +675,14 @@ pub async fn handle_thread_resume(
     // session's original cwd. Devin's serde tolerates `""`, but grok
     // rejects relative paths with `-32602 Invalid params: Path is not
     // absolute: `, so fall back to `/` when the client didn't supply one.
+    let cwd_sent = coerce_absolute_cwd(typed.cwd.as_deref()).to_string();
     let acp_request = json!({
         "sessionId": typed.thread_id,
-        "cwd": coerce_absolute_cwd(typed.cwd.as_deref()),
+        "cwd": cwd_sent,
         "mcpServers": [],
     });
 
-    let _acp_response = client
+    let acp_response = client
         .send_request("session/load", acp_request)
         .await
         .map_err(|e| JsonRpcError {
@@ -534,6 +694,9 @@ pub async fn handle_thread_resume(
             message: e.to_string(),
             data: None,
         })?;
+    client.mark_session_loaded(&typed.thread_id);
+    bridge.set_session_cwd(&typed.thread_id, &cwd_sent);
+    bridge.record_session_config(&typed.thread_id, &acp_response);
 
     // session/load also streams `available_commands_update` ahead of the
     // response — cache whatever the agent sends so `skills/list` returns
@@ -573,7 +736,11 @@ pub async fn handle_thread_resume(
     // Missing any one of these makes the iOS deserializer reject the whole
     // resume with `missing field <foo>`.
     let cwd = typed.cwd.clone().unwrap_or_default();
-    let model = typed.model.clone().unwrap_or_else(|| agent_id.clone());
+    let model = reported_model(
+        bridge,
+        &typed.thread_id,
+        typed.model.as_deref().unwrap_or(&agent_id),
+    );
     let model_provider = typed
         .model_provider
         .clone()
@@ -821,54 +988,31 @@ fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::Stored
         })
         .collect();
 
-    if user_boundaries.is_empty() {
-        // No clear boundaries — wrap the whole replay in one turn.
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in notifications {
-            translator.ingest(note);
+    // An optional preface before the first user message, then one turn per
+    // user message up to the next one; no user message: one turn.
+    let mut segments: Vec<(&str, &[Value])> = Vec::new();
+    match user_boundaries.first() {
+        None => segments.push(("turn-acp", notifications)),
+        Some(&first) => {
+            if first > 0 {
+                segments.push(("turn-acp-pre", &notifications[..first]));
+            }
+            for (i, &start) in user_boundaries.iter().enumerate() {
+                let end = user_boundaries
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(notifications.len());
+                segments.push(("turn-acp", &notifications[start..end]));
+            }
         }
-        let translated = translator.finish();
-        if translated.items.is_empty() {
-            return Vec::new();
-        }
-        return vec![crate::bridge::StoredTurn {
-            id: "turn-acp-0".to_string(),
-            items: translated.items,
-            status: "completed".to_string(),
-            started_at_ms: 0,
-            completed_at_ms: Some(0),
-            error: None,
-        }];
     }
 
     let mut turns = Vec::new();
-
-    // Any notifications before the first user_message_chunk form an
-    // implicit "preface" turn (rare — usually empty).
-    if user_boundaries[0] > 0 {
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in &notifications[..user_boundaries[0]] {
-            translator.ingest(note);
-        }
-        let translated = translator.finish();
-        if !translated.items.is_empty() {
-            turns.push(crate::bridge::StoredTurn {
-                id: format!("turn-acp-pre-{}", turns.len()),
-                items: translated.items,
-                status: "completed".to_string(),
-                started_at_ms: 0,
-                completed_at_ms: Some(0),
-                error: None,
-            });
-        }
-    }
-
-    // Slice [user_boundaries[i]..user_boundaries[i+1]] into turn i.
-    for (turn_idx, win) in user_boundaries.windows(2).enumerate() {
-        let start = win[0];
-        let end = win[1];
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in &notifications[start..end] {
+    for (prefix, notes) in segments {
+        // One counter for every turn, and item ids scoped to their turn.
+        let id = format!("{prefix}-{}", turns.len());
+        let mut translator = crate::translator::SessionUpdateTranslator::scoped(&id);
+        for note in notes {
             translator.ingest(note);
         }
         let translated = translator.finish();
@@ -876,25 +1020,7 @@ fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::Stored
             continue;
         }
         turns.push(crate::bridge::StoredTurn {
-            id: format!("turn-acp-{turn_idx}"),
-            items: translated.items,
-            status: "completed".to_string(),
-            started_at_ms: 0,
-            completed_at_ms: Some(0),
-            error: None,
-        });
-    }
-
-    // The last segment (from last user_message_chunk to end of stream).
-    let last_start = *user_boundaries.last().unwrap();
-    let mut translator = crate::translator::SessionUpdateTranslator::new();
-    for note in &notifications[last_start..] {
-        translator.ingest(note);
-    }
-    let translated = translator.finish();
-    if !translated.items.is_empty() {
-        turns.push(crate::bridge::StoredTurn {
-            id: format!("turn-acp-{}", turns.len()),
+            id,
             items: translated.items,
             status: "completed".to_string(),
             started_at_ms: 0,
@@ -972,6 +1098,91 @@ pub fn handle_thread_name_set(
     p::ThreadSetNameResponse {}
 }
 
+/// Bring the session's model / thinking level in line with the request
+/// via `session/set_config_option`. Failures are logged, never fatal.
+pub async fn apply_session_config(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<p::ReasoningEffort>,
+) {
+    if let Some(model) = config_options::model_change(&bridge.session_config(session_id), model) {
+        set_config(bridge, client, session_id, config_options::MODEL, &model).await;
+    }
+    // Checked after the model switch: levels differ per model.
+    if let Some(level) = config_options::effort_change(&bridge.session_config(session_id), effort) {
+        set_config(
+            bridge,
+            client,
+            session_id,
+            config_options::THOUGHT_LEVEL,
+            &level,
+        )
+        .await;
+    }
+}
+
+fn reported_model(bridge: &crate::bridge::AcpBridge, session_id: &str, fallback: &str) -> String {
+    config_options::current_value(&bridge.session_config(session_id), config_options::MODEL)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Make sure `session_id` is live in the process behind `client` before
+/// it is prompted: ACP agents keep sessions per process, so a respawned
+/// process answers `Session … not found` until the session is restored.
+/// Prefers `session/resume` (no replay), falls back to `session/load`
+/// (replay discarded); agents that support neither are prompted as-is.
+pub async fn ensure_session_ready(
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    session_id: &str,
+    fallback_cwd: Option<&str>,
+) -> Result<(), JsonRpcError> {
+    if client.is_session_loaded(session_id) {
+        return Ok(());
+    }
+    let caps = bridge.agent_capabilities();
+    let can_resume = caps.pointer("/sessionCapabilities/resume").is_some();
+    let can_load = caps
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !can_resume && !can_load {
+        return Ok(());
+    }
+    let cwd = bridge
+        .session_cwd(session_id)
+        .or_else(|| {
+            fallback_cwd
+                .filter(|c| c.starts_with('/'))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "/".to_string());
+    let params = json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []});
+    let method = if can_resume {
+        "session/resume"
+    } else {
+        "session/load"
+    };
+    info!(session_id, method, cwd = %cwd, "restoring ACP session in fresh process");
+    let response = client
+        .send_request(method, params)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: format!("Failed to restore ACP session: {}", e),
+            data: None,
+        })?;
+    bridge.record_session_config(session_id, &response);
+    if method == "session/load" {
+        let _ = client.take_pending_notifications().await;
+    }
+    bridge.set_session_cwd(session_id, &cwd);
+    client.mark_session_loaded(session_id);
+    Ok(())
+}
+
 /// Handle turn/start request.
 ///
 /// Lifecycle:
@@ -1009,6 +1220,24 @@ pub async fn handle_turn_start(
     })?;
 
     tracing::Span::current().record("thread_id", &typed.thread_id);
+    let request_cwd = typed
+        .cwd
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
+    ensure_session_ready(bridge, client, &typed.thread_id, request_cwd.as_deref()).await?;
+    {
+        // Not while model discovery walks the models (same saved default).
+        let _config_guard = bridge.config_guard().await;
+        apply_session_config(
+            bridge,
+            client,
+            &typed.thread_id,
+            typed.model.as_deref(),
+            typed.effort,
+        )
+        .await;
+    }
     info!("Starting turn for thread: {}", typed.thread_id);
 
     // Build ACP ContentBlock array from codex UserInput[]. Honors Text,
@@ -1313,6 +1542,7 @@ pub async fn handle_command_exec(
 /// Handle thread/fork request.
 pub async fn handle_thread_fork(
     ctx: &alleycat_bridge_core::Conn,
+    bridge: &crate::bridge::AcpBridge,
     client: &Arc<AcpClient>,
     params: Value,
 ) -> Result<Value, JsonRpcError> {
@@ -1333,6 +1563,7 @@ pub async fn handle_thread_fork(
         "mcpServers": [],
     });
 
+    let config_guard = bridge.config_guard().await;
     let acp_response = client
         .send_request("session/new", acp_request)
         .await
@@ -1341,12 +1572,16 @@ pub async fn handle_thread_fork(
             message: format!("Failed to send session/new for fork: {}", e),
             data: None,
         })?;
+    drop(config_guard);
 
     let new_session_id = acp_response
         .get("sessionId")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    client.mark_session_loaded(&new_session_id);
+    bridge.set_session_cwd(&new_session_id, &cwd);
+    bridge.record_session_config(&new_session_id, &acp_response);
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     let model = typed.model.clone().unwrap_or_else(|| agent_id.clone());

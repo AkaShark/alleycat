@@ -91,6 +91,7 @@ pub struct AgentsConfig {
     pub hermes: HermesAgentConfig,
     pub devin: DevinAgentConfig,
     pub grok: GrokAgentConfig,
+    pub mfcli: MfcliAgentConfig,
     pub shell: ShellAgentConfig,
 }
 
@@ -107,6 +108,7 @@ impl AgentsConfig {
             "hermes" => self.hermes.enabled,
             "devin" => self.devin.enabled,
             "grok" => self.grok.enabled,
+            "mfcli" => self.mfcli.enabled,
             "shell" => self.shell.enabled,
             _ => false,
         }
@@ -307,6 +309,24 @@ impl Default for GrokAgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct MfcliAgentConfig {
+    pub enabled: bool,
+    /// `mfcli` executable (an npm/nvm install is a `#!/usr/bin/env node`
+    /// script; give an absolute path if the login shell does not load nvm).
+    pub bin: String,
+}
+
+impl Default for MfcliAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "mfcli".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ShellAgentConfig {
     pub enabled: bool,
     pub shell_bin: String,
@@ -420,5 +440,16 @@ mod tests {
             Some("medium")
         );
         assert!(config.agents.shell.enabled);
+        assert!(config.agents.mfcli.enabled);
+        assert_eq!(config.agents.mfcli.bin, "mfcli");
+    }
+
+    #[test]
+    fn mfcli_config_parses_partial_table() {
+        let config: HostConfig =
+            toml::from_str("token = \"abc\"\n[agents.mfcli]\nbin = \"/opt/mf/mfcli\"\n").unwrap();
+        assert!(config.agents.mfcli.enabled);
+        assert_eq!(config.agents.mfcli.bin, "/opt/mf/mfcli");
+        assert!(config.agents.enabled_by_name("mfcli"));
     }
 }

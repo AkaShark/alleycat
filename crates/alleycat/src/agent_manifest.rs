@@ -200,12 +200,28 @@ pub const MANIFESTS: &[AgentManifest] = &[
         reports_effective_thread_permissions: false,
     },
     AgentManifest {
+        name: "mfcli",
+        display_name: "MyFlicker",
+        wire: AgentWire::Jsonl,
+        title: Some("MyFlicker"),
+        is_beta: true,
+        sort_order: 9,
+        description: Some("Kuaishou MyFlicker coding agent (mfcli acp)."),
+        aliases: &["myflicker", "codeflicker"],
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: None,
+        supports_ssh_bridge: false,
+        uses_direct_codex_port: false,
+        supports_thread_permission_overrides: false,
+        reports_effective_thread_permissions: false,
+    },
+    AgentManifest {
         name: "shell",
         display_name: "Shell",
         wire: AgentWire::Jsonl,
         title: Some("Shell"),
         is_beta: true,
-        sort_order: 9,
+        sort_order: 10,
         description: Some("PTY-backed host shell."),
         aliases: &["terminal"],
         locks_reasoning_effort_after_activity: false,
@@ -219,4 +235,21 @@ pub const MANIFESTS: &[AgentManifest] = &[
 
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {
     MANIFESTS.iter().find(|m| m.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mfcli_manifest_entry() {
+        let m = manifest_for("mfcli").expect("mfcli manifest");
+        assert_eq!(m.display_name, "MyFlicker");
+        assert_eq!(m.title, Some("MyFlicker"));
+        assert_eq!(m.aliases, &["myflicker", "codeflicker"]);
+        assert!(m.is_beta);
+        assert_eq!(m.sort_order, 9);
+        assert!(!m.supports_ssh_bridge);
+        assert_eq!(manifest_for("shell").unwrap().sort_order, 10);
+    }
 }
