@@ -220,9 +220,13 @@ impl TurnStreamEmitter {
         }
         if self.text.is_none() {
             let now_ms = chrono::Utc::now().timestamp_millis();
+            // Scoped to the turn: the phone upserts items by id across the
+            // whole thread, so a per-turn counter alone would overwrite the
+            // previous turns' text items.
+            let turn_key = self.turn_id.strip_prefix("turn-").unwrap_or(&self.turn_id);
             let item_id = match kind {
-                TextKind::AgentMessage => format!("acp-agent-{}", self.text_seq),
-                TextKind::Reasoning => format!("acp-reasoning-{}", self.text_seq),
+                TextKind::AgentMessage => format!("acp-agent-{turn_key}-{}", self.text_seq),
+                TextKind::Reasoning => format!("acp-reasoning-{turn_key}-{}", self.text_seq),
             };
             self.text_seq += 1;
             // Emit item/started with an empty shell so iOS reserves a

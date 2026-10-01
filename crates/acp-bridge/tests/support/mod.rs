@@ -117,6 +117,16 @@ impl Harness {
         read_frames(&self.dir.path().join("frames.jsonl"))
     }
 
+    /// Every frame the bridge queued for the phone so far, in order.
+    pub fn notifications(&self) -> Vec<Value> {
+        self.session
+            .install_attachment(Some(0))
+            .backlog
+            .into_iter()
+            .map(|f| f.payload)
+            .collect()
+    }
+
     pub fn methods(&self) -> Vec<String> {
         self.frames()
             .iter()
