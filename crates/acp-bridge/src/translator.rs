@@ -60,6 +60,8 @@ pub struct SessionUpdateTranslator {
     /// Added to minted ids so they stay unique across translators (one per
     /// replayed turn): the phone matches items by id across a thread.
     scope: Option<String>,
+    /// The session's working directory, for commands that report none.
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,8 +169,8 @@ impl ToolCallState {
 
 /// Alias kept for the streaming module's import.
 pub(crate) type ToolCallStatePublic = ToolCallState;
-pub(crate) fn render_tool_call_public(state: &ToolCallState) -> Value {
-    render_tool_call(state)
+pub(crate) fn render_tool_call_public(state: &ToolCallState, session_cwd: Option<&str>) -> Value {
+    render_tool_call(state, session_cwd)
 }
 
 impl SessionUpdateTranslator {
@@ -182,6 +184,7 @@ impl SessionUpdateTranslator {
             available_commands: None,
             seq: 0,
             scope: None,
+            cwd: None,
         }
     }
 
@@ -191,6 +194,12 @@ impl SessionUpdateTranslator {
             scope: Some(scope.to_string()),
             ..Self::new()
         }
+    }
+
+    /// Use `cwd` (the session's directory) for commands that report none.
+    pub fn with_cwd(mut self, cwd: Option<&str>) -> Self {
+        self.cwd = cwd.map(str::to_string);
+        self
     }
 
     /// Process one drained `session/update` notification frame.
@@ -338,7 +347,7 @@ impl SessionUpdateTranslator {
             _ => return,
         };
         let state = ToolCallState::from_announce(update);
-        let rendered = render_tool_call(&state);
+        let rendered = render_tool_call(&state, self.cwd.as_deref());
         self.push_item(rendered);
         self.tool_calls.insert(id, state);
     }
@@ -356,7 +365,7 @@ impl SessionUpdateTranslator {
             None => return,
         };
         state.merge_update(update);
-        let rendered = render_tool_call(state);
+        let rendered = render_tool_call(state, self.cwd.as_deref());
         let item_id = state.item_id.clone();
         self.replace_item(&item_id, rendered);
     }
@@ -538,7 +547,9 @@ fn write_image_data(data_b64: &str, mime: &str) -> std::io::Result<String> {
 /// * any update with at least one `{type: "diff"}` content block → `fileChange`
 /// * anything else → `dynamicToolCall` (a generic catch-all the codex
 ///   schema accepts)
-fn render_tool_call(state: &ToolCallState) -> Value {
+///
+/// `session_cwd` fills a command's `cwd` when the call reports none.
+fn render_tool_call(state: &ToolCallState, session_cwd: Option<&str>) -> Value {
     let codex_status = map_status(&state.status);
     let duration_ms = state
         .completed_at_ms
@@ -590,6 +601,8 @@ fn render_tool_call(state: &ToolCallState) -> Value {
             .map(str::to_string)
             .or_else(|| extract_command_from_content(&state.content))
             .unwrap_or_else(|| state.title.clone());
+        // Codex types `cwd` as an absolute path: phones drop a whole
+        // notification whose `cwd` is empty, and mfcli reports none.
         let cwd = state
             .raw_input
             .get("cwd")
@@ -600,7 +613,9 @@ fn render_tool_call(state: &ToolCallState) -> Value {
                     .first()
                     .and_then(|loc| loc.get("path").and_then(|v| v.as_str()))
             })
-            .unwrap_or("")
+            .filter(|cwd| !cwd.is_empty())
+            .or(session_cwd)
+            .unwrap_or("/")
             .to_string();
         let aggregated_output = aggregate_text_output(&state.content);
         let exit_code = state
@@ -869,6 +884,19 @@ mod tests {
         assert_eq!(out.items[1]["type"], "agentMessage");
         assert_eq!(out.items[2]["type"], "reasoning");
         assert_eq!(out.items[3]["type"], "agentMessage");
+    }
+
+    #[test]
+    fn command_without_a_cwd_gets_the_session_cwd() {
+        // mfcli's `execute` calls carry no `rawInput.cwd` and no
+        // `locations`; codex needs an absolute `cwd`.
+        let mut t = SessionUpdateTranslator::scoped("turn-acp-0").with_cwd(Some("/work/app"));
+        t.ingest(&tool_call_note("call_001", "execute", "pwd", "pwd"));
+        assert_eq!(t.finish().items[0]["cwd"], "/work/app");
+
+        let mut t = SessionUpdateTranslator::new();
+        t.ingest(&tool_call_note("call_001", "execute", "pwd", "pwd"));
+        assert_eq!(t.finish().items[0]["cwd"], "/");
     }
 
     #[test]

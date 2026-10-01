@@ -724,7 +724,8 @@ pub async fn handle_thread_resume(
     let stored_turns: Vec<crate::bridge::StoredTurn> = if !local_turns.is_empty() {
         local_turns
     } else {
-        let rebuilt = build_turns_from_replay(&acp_notifications);
+        let session_cwd = bridge.session_cwd(&typed.thread_id);
+        let rebuilt = build_turns_from_replay(&acp_notifications, session_cwd.as_deref());
         if !rebuilt.is_empty() {
             bridge.set_turns(&typed.thread_id, rebuilt.clone());
         }
@@ -987,7 +988,10 @@ fn extract_available_commands(notifications: &[Value]) -> Option<Vec<Value>> {
 /// `user_message_chunk` — each user message starts a new turn.
 /// Notifications before the first user message (preface from the agent)
 /// land in a "turn-acp-pre" bucket so they're not lost.
-fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::StoredTurn> {
+fn build_turns_from_replay(
+    notifications: &[Value],
+    session_cwd: Option<&str>,
+) -> Vec<crate::bridge::StoredTurn> {
     // Find indices of user_message_chunk frames so we know where to slice.
     let user_boundaries: Vec<usize> = notifications
         .iter()
@@ -1029,7 +1033,8 @@ fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::Stored
     for (prefix, notes) in segments {
         // One counter for every turn, and item ids scoped to their turn.
         let id = format!("{prefix}-{}", turns.len());
-        let mut translator = crate::translator::SessionUpdateTranslator::scoped(&id);
+        let mut translator =
+            crate::translator::SessionUpdateTranslator::scoped(&id).with_cwd(session_cwd);
         for note in notes {
             translator.ingest(note);
         }
@@ -1353,6 +1358,9 @@ pub async fn handle_turn_start(
     // codex item/* notifications on the fly and also accumulates the
     // final item list for StoredTurn.
     let notifier = ctx.notifier().clone();
+    let session_cwd = bridge
+        .session_cwd(&typed.thread_id)
+        .or_else(|| request_cwd.clone());
     let emitter = Arc::new(std::sync::Mutex::new(Some(
         crate::streaming::TurnStreamEmitter::new(
             move |method, params| {
@@ -1360,7 +1368,8 @@ pub async fn handle_turn_start(
             },
             typed.thread_id.clone(),
             stable_turn_id.clone(),
-        ),
+        )
+        .with_cwd(session_cwd.as_deref()),
     )));
     bridge.begin_turn(
         &typed.thread_id,

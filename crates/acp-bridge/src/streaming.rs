@@ -67,6 +67,8 @@ pub struct TurnStreamEmitter {
     /// Most-recent ACP `current_mode_update` modeId. ACP carries this
     /// as `{sessionUpdate:"current_mode_update", currentModeId: string}`.
     current_mode: Option<String>,
+    /// The session's working directory, for commands that report none.
+    cwd: Option<String>,
 }
 
 struct TextRun {
@@ -129,7 +131,14 @@ impl TurnStreamEmitter {
             plan_entries: None,
             available_commands: None,
             current_mode: None,
+            cwd: None,
         }
+    }
+
+    /// Use `cwd` (the session's directory) for commands that report none.
+    pub fn with_cwd(mut self, cwd: Option<&str>) -> Self {
+        self.cwd = cwd.map(str::to_string);
+        self
     }
 
     /// Process one inbound `session/update` notification.
@@ -200,7 +209,7 @@ impl TurnStreamEmitter {
         let drained: Vec<(String, InflightToolCall)> = self.tool_calls.drain().collect();
         for (_id, infl) in drained {
             if !infl.completed {
-                let item = render_tool_call_public(&infl.state);
+                let item = render_tool_call_public(&infl.state, self.cwd.as_deref());
                 self.replace_item(&infl.state.item_id, item.clone());
                 self.emit_item_completed(&item);
             }
@@ -320,7 +329,7 @@ impl TurnStreamEmitter {
             _ => return,
         };
         let state = ToolCallStatePublic::from_announce(update);
-        let item = render_tool_call_public(&state);
+        let item = render_tool_call_public(&state, self.cwd.as_deref());
         let started_at = state.started_at_ms;
         self.emit_item_started(&item, started_at);
         self.push_item(item);
@@ -348,7 +357,7 @@ impl TurnStreamEmitter {
         let (item, item_id, terminal) = {
             let infl = self.tool_calls.get_mut(&id).expect("inserted above");
             infl.state.merge_update(update);
-            let item = render_tool_call_public(&infl.state);
+            let item = render_tool_call_public(&infl.state, self.cwd.as_deref());
             let item_id = infl.state.item_id.clone();
             let terminal = matches!(infl.state.status.as_str(), "completed" | "failed");
             if terminal {
@@ -554,6 +563,22 @@ mod tests {
         assert_eq!(finish.items.len(), 1);
         assert_eq!(finish.items[0]["type"], "commandExecution");
         assert_eq!(finish.items[0]["status"], "completed");
+    }
+
+    #[test]
+    fn command_without_a_cwd_streams_with_the_session_cwd() {
+        let (emitter, captured) = capturing_emitter();
+        let mut emitter = emitter.with_cwd(Some("/work/app"));
+        emitter.ingest(&tool_call_note("c1", "execute", "pwd"));
+        emitter.ingest(&tool_update_note("c1", "completed", "/work/app\n"));
+        let finish = emitter.finish();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2, "{captured:?}");
+        for (_, params) in captured.iter() {
+            assert_eq!(params["item"]["cwd"], "/work/app");
+        }
+        assert_eq!(finish.items[0]["cwd"], "/work/app");
     }
 
     #[test]
