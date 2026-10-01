@@ -149,3 +149,53 @@ async fn catalog_is_complete_when_a_thread_came_first() {
     h.call("model/list", json!({})).await.unwrap();
     assert_eq!(config_sets(&h).len(), walked);
 }
+
+#[tokio::test]
+async fn thread_start_waits_for_discovery() {
+    // mfcli keeps one saved default, which every switch rewrites: a thread
+    // started mid-walk would begin on whichever model the walk is on.
+    let mut config = per_model_agent();
+    config["config_delay_ms"] = json!(100);
+    let h = Harness::with(config, |b| b.discover_models(true)).await;
+    h.initialize().await;
+    let start_later = async {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        h.call("thread/start", json!({"cwd": h.project_dir()}))
+            .await
+            .unwrap()
+    };
+    let (list, _) = tokio::join!(h.call("model/list", json!({})), start_later);
+    list.unwrap();
+
+    let frames = h.frames();
+    let thread_new = frames
+        .iter()
+        .position(|f| f["method"] == "session/new" && f["params"]["cwd"] == json!(h.project_dir()))
+        .expect("thread's session/new");
+    let last_switch = frames
+        .iter()
+        .rposition(|f| f["method"] == "session/set_config_option")
+        .expect("discovery switches");
+    assert!(
+        thread_new > last_switch,
+        "thread/start ran during discovery: session/new at {thread_new}, last switch at {last_switch}"
+    );
+}
+
+#[tokio::test]
+async fn without_discovery_every_model_keeps_the_shared_levels() {
+    // Devin / Grok: no discovery, so a session on a model without levels
+    // must not give that one model an empty list while the rest differ.
+    let mut config = per_model_agent();
+    config["models"] = json!([
+        {"value": "m/gamma", "levels": []},
+        {"value": "m/alpha", "levels": ["low", "high"]}
+    ]);
+    let h = Harness::new(config).await;
+    h.initialize().await;
+    h.start_thread().await;
+    let list = h.call("model/list", json!({})).await.unwrap();
+    for id in ["m/gamma", "m/alpha"] {
+        assert_eq!(efforts(model(&list, id)), vec!["medium"], "{id}");
+    }
+}

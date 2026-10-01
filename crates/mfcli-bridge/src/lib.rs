@@ -16,8 +16,9 @@
 //! - model and thinking level: mfcli saves every `session/set_config_option`
 //!   as the user's default (`~/.codeflicker/config.json`, like `/model` in
 //!   its terminal UI), so choosing them on the phone also changes the
-//!   default of terminal `mfcli`. Model discovery switches back to where it
-//!   started.
+//!   default of terminal `mfcli`. Switching models leaves the saved
+//!   thinking level alone; model discovery switches back to the model it
+//!   started on.
 
 pub mod index;
 pub mod listing;

@@ -18,9 +18,13 @@
 //! - `models`: `[ {value, levels: [..]} ]` replaces the fixed model list;
 //!   each model offers its own `thought_level` values (none when `levels`
 //!   is empty) and switching model resets the level to `high` (or the
-//!   model's first level), as mfcli does
+//!   model's first level). Stricter than mfcli, which keeps its saved
+//!   level, so tests see whether the bridge puts a level back
 //! - `default_thought`: a new session's level in `models` mode (default
 //!   `high`)
+//! - `history`: `[[question, answer], ...]` replayed by `session/load`
+//!   (default: one exchange)
+//! - `config_delay_ms`: sleep inside session/set_config_option
 //!
 //! `--spawn-log <path>` appends the process working directory on startup.
 
@@ -263,14 +267,21 @@ impl FakeAgent {
             }
             "session/load" => {
                 self.sessions.insert(session_id.clone());
-                update(
-                    &session_id,
-                    json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "earlier question"}}),
-                );
-                update(
-                    &session_id,
-                    json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "earlier answer"}}),
-                );
+                let history = self
+                    .config
+                    .get("history")
+                    .cloned()
+                    .unwrap_or_else(|| json!([["earlier question", "earlier answer"]]));
+                for exchange in history.as_array().into_iter().flatten() {
+                    update(
+                        &session_id,
+                        json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": exchange[0]}}),
+                    );
+                    update(
+                        &session_id,
+                        json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": exchange[1]}}),
+                    );
+                }
                 ok(
                     &id,
                     json!({"configOptions": self.config_options(&session_id)}),
@@ -312,6 +323,9 @@ impl FakeAgent {
                 );
             }
             "session/set_config_option" => {
+                if let Some(ms) = self.config.get("config_delay_ms").and_then(Value::as_u64) {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
                 let config_id = params.get("configId").and_then(Value::as_str).unwrap_or("");
                 let value = params.get("value").and_then(Value::as_str).unwrap_or("");
                 let options = self.config_options(&session_id);

@@ -147,9 +147,15 @@ pub async fn handle_model_list(
         // their sessions only show the levels of their current model.
         let mut done = bridge.model_discovery().await;
         if !*done {
-            match discover_models(bridge, ctx).await {
-                Ok(()) => *done = true,
-                Err(err) => tracing::warn!(error = %err, "model discovery failed"),
+            match tokio::time::timeout(MODEL_DISCOVERY_TIMEOUT, discover_models(bridge, ctx)).await
+            {
+                Ok(Ok(())) => *done = true,
+                Ok(Err(err)) => tracing::warn!(error = %err, "model discovery failed"),
+                Err(_) => {
+                    // Not retried: a hung agent would stall every model/list.
+                    tracing::warn!("model discovery timed out");
+                    *done = true;
+                }
             }
         }
     }
@@ -187,7 +193,13 @@ pub async fn handle_model_list(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let is_default = traits.default_model.as_deref() == Some(id);
-                let efforts = match bridge.model_levels(id) {
+                // Per-model levels only for agents that discover them; the
+                // others keep one set of levels for every model.
+                let levels = bridge
+                    .discover_models_enabled()
+                    .then(|| bridge.model_levels(id))
+                    .flatten();
+                let efforts = match levels {
                     Some(levels) => effort_options(levels.as_ref()),
                     None => (traits.efforts.clone(), traits.default_effort),
                 };
@@ -200,6 +212,9 @@ pub async fn handle_model_list(
         next_cursor: None,
     }
 }
+
+/// Upper bound for model discovery (it switches through every model once).
+const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 async fn discover_models(
     bridge: &crate::bridge::AcpBridge,
@@ -252,6 +267,14 @@ async fn discover_model_levels(
     )
     .await;
     let now = bridge.session_config(session_id);
+    if config_options::current_value(&now, config_options::MODEL).as_deref()
+        != Some(start_model.as_str())
+    {
+        tracing::error!(
+            model = %start_model,
+            "model discovery could not switch back; the agent's saved default model may have changed"
+        );
+    }
     if let Some(level) = start_level
         && config_options::current_value(&now, config_options::THOUGHT_LEVEL).as_deref()
             != Some(level.as_str())
@@ -466,6 +489,9 @@ pub async fn handle_thread_start(
         .and_then(Value::as_str)
         .unwrap_or("/")
         .to_string();
+    // Until the requested model is applied: a new session starts on the
+    // agent's saved default, which model discovery rewrites while it runs.
+    let config_guard = bridge.config_guard().await;
     let acp_response = client
         .send_request("session/new", acp_request)
         .await
@@ -494,6 +520,7 @@ pub async fn handle_thread_start(
     // real data instead of placeholder rows.
     bridge.record_session_config(&session_id, &acp_response);
     apply_session_config(bridge, client, &session_id, typed.model.as_deref(), None).await;
+    drop(config_guard);
     let modes = extract_modes_from_session_new(&acp_response);
     if modes.current.is_some() || !modes.available.is_empty() {
         bridge.set_modes(&session_id, modes);
@@ -961,54 +988,31 @@ fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::Stored
         })
         .collect();
 
-    if user_boundaries.is_empty() {
-        // No clear boundaries — wrap the whole replay in one turn.
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in notifications {
-            translator.ingest(note);
+    // An optional preface before the first user message, then one turn per
+    // user message up to the next one; no user message: one turn.
+    let mut segments: Vec<(&str, &[Value])> = Vec::new();
+    match user_boundaries.first() {
+        None => segments.push(("turn-acp", notifications)),
+        Some(&first) => {
+            if first > 0 {
+                segments.push(("turn-acp-pre", &notifications[..first]));
+            }
+            for (i, &start) in user_boundaries.iter().enumerate() {
+                let end = user_boundaries
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(notifications.len());
+                segments.push(("turn-acp", &notifications[start..end]));
+            }
         }
-        let translated = translator.finish();
-        if translated.items.is_empty() {
-            return Vec::new();
-        }
-        return vec![crate::bridge::StoredTurn {
-            id: "turn-acp-0".to_string(),
-            items: translated.items,
-            status: "completed".to_string(),
-            started_at_ms: 0,
-            completed_at_ms: Some(0),
-            error: None,
-        }];
     }
 
     let mut turns = Vec::new();
-
-    // Any notifications before the first user_message_chunk form an
-    // implicit "preface" turn (rare — usually empty).
-    if user_boundaries[0] > 0 {
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in &notifications[..user_boundaries[0]] {
-            translator.ingest(note);
-        }
-        let translated = translator.finish();
-        if !translated.items.is_empty() {
-            turns.push(crate::bridge::StoredTurn {
-                id: format!("turn-acp-pre-{}", turns.len()),
-                items: translated.items,
-                status: "completed".to_string(),
-                started_at_ms: 0,
-                completed_at_ms: Some(0),
-                error: None,
-            });
-        }
-    }
-
-    // Slice [user_boundaries[i]..user_boundaries[i+1]] into turn i.
-    for (turn_idx, win) in user_boundaries.windows(2).enumerate() {
-        let start = win[0];
-        let end = win[1];
-        let mut translator = crate::translator::SessionUpdateTranslator::new();
-        for note in &notifications[start..end] {
+    for (prefix, notes) in segments {
+        // One counter for every turn, and item ids scoped to their turn.
+        let id = format!("{prefix}-{}", turns.len());
+        let mut translator = crate::translator::SessionUpdateTranslator::scoped(&id);
+        for note in notes {
             translator.ingest(note);
         }
         let translated = translator.finish();
@@ -1016,25 +1020,7 @@ fn build_turns_from_replay(notifications: &[Value]) -> Vec<crate::bridge::Stored
             continue;
         }
         turns.push(crate::bridge::StoredTurn {
-            id: format!("turn-acp-{turn_idx}"),
-            items: translated.items,
-            status: "completed".to_string(),
-            started_at_ms: 0,
-            completed_at_ms: Some(0),
-            error: None,
-        });
-    }
-
-    // The last segment (from last user_message_chunk to end of stream).
-    let last_start = *user_boundaries.last().unwrap();
-    let mut translator = crate::translator::SessionUpdateTranslator::new();
-    for note in &notifications[last_start..] {
-        translator.ingest(note);
-    }
-    let translated = translator.finish();
-    if !translated.items.is_empty() {
-        turns.push(crate::bridge::StoredTurn {
-            id: format!("turn-acp-{}", turns.len()),
+            id,
             items: translated.items,
             status: "completed".to_string(),
             started_at_ms: 0,
@@ -1240,14 +1226,18 @@ pub async fn handle_turn_start(
         .and_then(|p| p.to_str())
         .map(str::to_string);
     ensure_session_ready(bridge, client, &typed.thread_id, request_cwd.as_deref()).await?;
-    apply_session_config(
-        bridge,
-        client,
-        &typed.thread_id,
-        typed.model.as_deref(),
-        typed.effort,
-    )
-    .await;
+    {
+        // Not while model discovery walks the models (same saved default).
+        let _config_guard = bridge.config_guard().await;
+        apply_session_config(
+            bridge,
+            client,
+            &typed.thread_id,
+            typed.model.as_deref(),
+            typed.effort,
+        )
+        .await;
+    }
     info!("Starting turn for thread: {}", typed.thread_id);
 
     // Build ACP ContentBlock array from codex UserInput[]. Honors Text,
@@ -1573,6 +1563,7 @@ pub async fn handle_thread_fork(
         "mcpServers": [],
     });
 
+    let config_guard = bridge.config_guard().await;
     let acp_response = client
         .send_request("session/new", acp_request)
         .await
@@ -1581,6 +1572,7 @@ pub async fn handle_thread_fork(
             message: format!("Failed to send session/new for fork: {}", e),
             data: None,
         })?;
+    drop(config_guard);
 
     let new_session_id = acp_response
         .get("sessionId")

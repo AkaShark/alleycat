@@ -57,6 +57,9 @@ pub struct SessionUpdateTranslator {
     /// Monotonic counter used to mint unique ids for items that don't
     /// otherwise have one (text chunks, fabricated user messages).
     seq: usize,
+    /// Added to minted ids so they stay unique across translators (one per
+    /// replayed turn): the phone matches items by id across a thread.
+    scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +181,15 @@ impl SessionUpdateTranslator {
             plan_entries: None,
             available_commands: None,
             seq: 0,
+            scope: None,
+        }
+    }
+
+    /// A translator whose minted ids include `scope` (e.g. the turn id).
+    pub fn scoped(scope: &str) -> Self {
+        Self {
+            scope: Some(scope.to_string()),
+            ..Self::new()
         }
     }
 
@@ -373,7 +385,10 @@ impl SessionUpdateTranslator {
     }
 
     fn next_id(&mut self, prefix: &str) -> String {
-        let id = format!("{prefix}-{}", self.seq);
+        let id = match &self.scope {
+            Some(scope) => format!("{prefix}-{scope}-{}", self.seq),
+            None => format!("{prefix}-{}", self.seq),
+        };
         self.seq += 1;
         id
     }

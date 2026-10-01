@@ -54,6 +54,8 @@ conformance suite; the daemon sets everything explicitly).
 Thinking levels can differ per model (mfcli). With `discover_models(true)`
 the first `model/list` switches a throwaway session through every model to
 learn each one's levels, then back to the model and level it started with.
+Starting a session and switching a session's model or level wait while it
+runs (at most 60 s), because mfcli keeps one saved default for all of them.
 The phone has no `max` level (it drops levels it does not know), so an
 agent's `max` is offered as `xhigh`, and sent back as `max`, unless the model
 also has a real `xhigh`; then `max` is not offered.

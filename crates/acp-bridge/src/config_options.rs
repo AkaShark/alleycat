@@ -107,10 +107,25 @@ pub fn model_change(options: &[Value], model: Option<&str>) -> Option<String> {
 }
 
 /// Thinking level to switch to, checked against the levels the session's
-/// current model offers (so apply a model change first).
+/// current model offers (so apply a model change first). A level the
+/// phone already shows as current (e.g. `max`, shown as `xhigh`) is kept.
 pub fn effort_change(options: &[Value], effort: Option<p::ReasoningEffort>) -> Option<String> {
-    let level = thought_level_for(effort?, &values(options, THOUGHT_LEVEL));
+    let effort = effort?;
+    let current = current_value(options, THOUGHT_LEVEL);
+    if current.as_deref().and_then(effort_for) == Some(phone_effort(effort)) {
+        return None;
+    }
+    let level = thought_level_for(effort, &values(options, THOUGHT_LEVEL));
     wants(options, THOUGHT_LEVEL, &level).then_some(level)
+}
+
+/// The phone-side effort `effort` ends up as (see [`effort_for`]).
+fn phone_effort(effort: p::ReasoningEffort) -> p::ReasoningEffort {
+    match effort {
+        p::ReasoningEffort::None | p::ReasoningEffort::Minimal => p::ReasoningEffort::Low,
+        p::ReasoningEffort::Max => p::ReasoningEffort::XHigh,
+        other => other,
+    }
 }
 
 fn wants(options: &[Value], id: &str, value: &str) -> bool {
@@ -194,6 +209,22 @@ mod tests {
         );
         assert_eq!(effort_change(&[], Some(p::ReasoningEffort::High)), None);
         assert_eq!(effort_change(&opts, None), None);
+    }
+
+    #[test]
+    fn xhigh_keeps_a_current_max() {
+        // The phone shows a current `max` as `xhigh` and sends that back
+        // with every turn; it must not lower the level.
+        let opts = vec![json!({
+            "id": "thought_level",
+            "currentValue": "max",
+            "options": [{"value": "high"}, {"value": "xhigh"}, {"value": "max"}],
+        })];
+        assert_eq!(effort_change(&opts, Some(p::ReasoningEffort::XHigh)), None);
+        assert_eq!(
+            effort_change(&opts, Some(p::ReasoningEffort::High)).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

@@ -139,9 +139,10 @@ pub struct AcpBridge {
     model_levels: DashMap<String, Option<Value>>,
     /// Fetch the model catalog from a throwaway session when empty.
     discover_models: bool,
-    /// Whether model discovery has completed; held while it runs so
-    /// concurrent `model/list` calls do not walk the models twice.
-    model_discovery: tokio::sync::Mutex<bool>,
+    /// Whether model discovery has completed. Discovery holds it for
+    /// writing; starting a session or switching its model holds it for
+    /// reading, since both touch the agent's saved default (mfcli).
+    model_discovery: tokio::sync::RwLock<bool>,
     /// One process per project directory (see the builder).
     process_per_cwd: bool,
 }
@@ -195,9 +196,20 @@ impl AcpBridge {
         self.discover_models
     }
 
-    /// Lock around model discovery; the value says whether it has run.
-    pub async fn model_discovery(&self) -> tokio::sync::MutexGuard<'_, bool> {
-        self.model_discovery.lock().await
+    /// Exclusive lock for model discovery; the value says whether it ran.
+    pub async fn model_discovery(&self) -> tokio::sync::RwLockWriteGuard<'_, bool> {
+        self.model_discovery.write().await
+    }
+
+    /// Held while creating a session or applying a model / thinking level,
+    /// so neither runs while discovery walks the models. `None` when
+    /// discovery is off.
+    pub async fn config_guard(&self) -> Option<tokio::sync::RwLockReadGuard<'_, bool>> {
+        if self.discover_models {
+            Some(self.model_discovery.read().await)
+        } else {
+            None
+        }
     }
 
     /// Secondary ACP process for this connection. Read-only calls
@@ -860,7 +872,7 @@ impl AcpBridgeBuilder {
             session_config: DashMap::new(),
             model_levels: DashMap::new(),
             discover_models: self.discover_models,
-            model_discovery: tokio::sync::Mutex::new(false),
+            model_discovery: tokio::sync::RwLock::new(false),
             process_per_cwd: self.process_per_cwd,
         }))
     }
