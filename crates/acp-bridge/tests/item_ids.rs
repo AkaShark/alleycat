@@ -22,12 +22,8 @@ async fn item_ids_are_unique_across_turns() {
     h.initialize().await;
     let thread_id = h.start_thread().await;
     for text in ["first", "second"] {
-        h.call(
-            "turn/start",
-            json!({"threadId": thread_id, "input": text_input(text)}),
-        )
-        .await
-        .expect("turn/start");
+        h.run_turn(json!({"threadId": thread_id, "input": text_input(text)}))
+            .await;
     }
 
     let ids = started_item_ids(&h.notifications());

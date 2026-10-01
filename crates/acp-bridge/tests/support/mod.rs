@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alleycat_acp_bridge::{AcpBridge, AcpBridgeBuilder};
 use alleycat_bridge_core::session::Session;
@@ -79,6 +80,30 @@ impl Harness {
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, JsonRpcError> {
         self.bridge.dispatch(&self.conn(), method, params).await
+    }
+
+    /// `turn/start`, then wait for the turn to end. `turn/start` answers
+    /// while the prompt is still running; this returns `{"turn": …}` with
+    /// the finished turn from `turn/completed`.
+    pub async fn run_turn(&self, params: Value) -> Value {
+        let started = self.call("turn/start", params).await.expect("turn/start");
+        json!({"turn": self.wait_turn_completed(&started["turn"]["id"]).await})
+    }
+
+    /// The finished turn from the `turn/completed` notification for `turn_id`.
+    pub async fn wait_turn_completed(&self, turn_id: &Value) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let completed = self
+                .notifications()
+                .into_iter()
+                .find(|f| f["method"] == "turn/completed" && f["params"]["turn"]["id"] == *turn_id);
+            if let Some(frame) = completed {
+                return frame["params"]["turn"].clone();
+            }
+            assert!(Instant::now() < deadline, "turn {turn_id} never completed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     pub async fn start_thread(&self) -> String {

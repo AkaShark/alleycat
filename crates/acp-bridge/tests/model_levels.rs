@@ -103,12 +103,10 @@ async fn turn_checks_effort_against_the_new_model() {
     let sid = h.start_thread().await;
 
     // beta has no xhigh: the phone's top level becomes beta's `max`.
-    h.call(
-        "turn/start",
+    h.run_turn(
         json!({"threadId": sid, "input": text_input("one"), "model": "m/beta", "effort": "xhigh"}),
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         config_sets(&h),
         vec![
@@ -118,12 +116,10 @@ async fn turn_checks_effort_against_the_new_model() {
     );
 
     // beta has no `low`, but the turn switches to alpha, which does.
-    h.call(
-        "turn/start",
+    h.run_turn(
         json!({"threadId": sid, "input": text_input("two"), "model": "m/alpha", "effort": "low"}),
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         &config_sets(&h)[2..],
         &[

@@ -90,13 +90,26 @@ pub struct ModesSnapshot {
     pub available: Vec<Value>,
 }
 
+/// A turn whose `session/prompt` is still running.
+pub(crate) struct ActiveTurn {
+    pub(crate) id: String,
+    pub(crate) started_at_ms: i64,
+    pub(crate) user_item: Value,
+    /// `None` once the prompt has ended and the turn is being stored.
+    pub(crate) stream: Arc<std::sync::Mutex<Option<crate::streaming::TurnStreamEmitter>>>,
+}
+
 /// Unified ACP bridge facade.
 pub struct AcpBridge {
+    /// The bridge itself, for prompts that outlive their `turn/start`.
+    this: std::sync::Weak<AcpBridge>,
     pool: Arc<AcpPool>,
     /// All completed turns we've observed, keyed by codex thread/session
     /// id. The list is ordered oldest→newest so `thread/read` can emit
     /// turns in chronological order without re-sorting.
     turns: DashMap<String, Vec<StoredTurn>>,
+    /// Turns whose prompt is still running, keyed by thread id.
+    active_turns: DashMap<String, ActiveTurn>,
     /// Session status per thread ID
     session_status: DashMap<String, SessionStatus>,
     /// Latest ACP `available_commands_update` payload, keyed by ACP
@@ -540,6 +553,56 @@ impl AcpBridge {
             .send_notification("thread/name/updated", notification);
     }
 
+    pub(crate) fn this(&self) -> Option<Arc<AcpBridge>> {
+        self.this.upgrade()
+    }
+
+    pub(crate) fn begin_turn(&self, thread_id: &str, turn: ActiveTurn) {
+        self.active_turns.insert(thread_id.to_string(), turn);
+    }
+
+    pub(crate) fn end_turn(&self, thread_id: &str, turn_id: &str) {
+        self.active_turns
+            .remove_if(thread_id, |_, turn| turn.id == turn_id);
+    }
+
+    /// The running turn of `thread_id` as a codex `Turn`, with the items
+    /// streamed so far.
+    pub(crate) fn running_turn_json(&self, thread_id: &str) -> Option<Value> {
+        // Copy out first: the items are cloned without holding the map lock.
+        let (id, started_at_ms, user_item, stream) = {
+            let turn = self.active_turns.get(thread_id)?;
+            let stream = Arc::clone(&turn.stream);
+            (
+                turn.id.clone(),
+                turn.started_at_ms,
+                turn.user_item.clone(),
+                stream,
+            )
+        };
+        let mut items = vec![user_item];
+        let stream = stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stream) = stream.as_ref() {
+            items.extend(stream.items_so_far());
+        }
+        Some(json!({
+            "id": id,
+            "items": items,
+            "itemsView": "full",
+            "status": "inProgress",
+            "error": null,
+            "startedAt": started_at_ms / 1000,
+            "completedAt": null,
+            "durationMs": null,
+        }))
+    }
+
+    pub(crate) fn has_active_turn(&self, thread_id: &str) -> bool {
+        self.active_turns.contains_key(thread_id)
+    }
+
     /// Set session status and emit thread/status/changed notification if it changed.
     #[instrument(skip(self, ctx), fields(thread_id = %thread_id, new_status = ?new_status))]
     pub fn set_session_status(&self, ctx: &Conn, thread_id: &str, new_status: SessionStatus) {
@@ -854,9 +917,11 @@ impl AcpBridgeBuilder {
         let pool_clone = Arc::clone(&pool);
         let eviction_handle = pool_clone.start_eviction_task();
 
-        Ok(Arc::new(AcpBridge {
+        Ok(Arc::new_cyclic(|this| AcpBridge {
+            this: this.clone(),
             pool,
             turns: DashMap::new(),
+            active_turns: DashMap::new(),
             session_status: DashMap::new(),
             available_commands: DashMap::new(),
             models: DashMap::new(),

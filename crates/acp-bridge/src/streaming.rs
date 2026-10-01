@@ -81,6 +81,24 @@ enum TextKind {
     Reasoning,
 }
 
+fn text_run_item(run: &TextRun) -> Value {
+    match run.kind {
+        TextKind::AgentMessage => json!({
+            "id": &run.item_id,
+            "type": "agentMessage",
+            "text": &run.accumulated,
+            "phase": null,
+            "memoryCitation": null,
+        }),
+        TextKind::Reasoning => json!({
+            "id": &run.item_id,
+            "type": "reasoning",
+            "summary": [],
+            "content": [&run.accumulated],
+        }),
+    }
+}
+
 struct InflightToolCall {
     state: ToolCallStatePublic,
     completed: bool,
@@ -165,6 +183,14 @@ impl TurnStreamEmitter {
             // usage_update, vendor-specific kinds: drop.
             _ => {}
         }
+    }
+
+    /// Items streamed so far, including the open text run, for a
+    /// `thread/resume` that arrives mid-turn. Emits nothing.
+    pub fn items_so_far(&self) -> Vec<Value> {
+        let mut items = self.items.clone();
+        items.extend(self.text.as_ref().map(text_run_item));
+        items
     }
 
     /// Close open text runs, emit item/completed for any still-pending
@@ -283,21 +309,7 @@ impl TurnStreamEmitter {
             Some(r) => r,
             None => return,
         };
-        let item = match run.kind {
-            TextKind::AgentMessage => json!({
-                "id": &run.item_id,
-                "type": "agentMessage",
-                "text": run.accumulated,
-                "phase": null,
-                "memoryCitation": null,
-            }),
-            TextKind::Reasoning => json!({
-                "id": &run.item_id,
-                "type": "reasoning",
-                "summary": [],
-                "content": [run.accumulated],
-            }),
-        };
+        let item = text_run_item(&run);
         self.push_item(item.clone());
         self.emit_item_completed(&item);
     }
@@ -462,6 +474,22 @@ mod tests {
             .iter()
             .map(|(m, _)| m.clone())
             .collect()
+    }
+
+    #[test]
+    fn items_so_far_include_the_open_text_run_without_emitting() {
+        let (mut e, captured) = capturing_emitter();
+        e.ingest(&tool_call_note("t1", "execute", "ls"));
+        e.ingest(&note("agent_message_chunk", "Hel"));
+        e.ingest(&note("agent_message_chunk", "lo"));
+        let emitted = methods(&captured).len();
+
+        let items = e.items_so_far();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[1]["type"], "agentMessage");
+        assert_eq!(items[1]["text"], "Hello");
+        assert_eq!(methods(&captured).len(), emitted);
+        assert_eq!(e.finish().items[1]["text"], "Hello");
     }
 
     #[test]

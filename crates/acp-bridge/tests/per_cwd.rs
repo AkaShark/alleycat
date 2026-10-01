@@ -18,12 +18,8 @@ async fn start_in(h: &Harness, cwd: &str) -> String {
 
 async fn turn_text(h: &Harness, sid: &str) -> String {
     let turn = h
-        .call(
-            "turn/start",
-            json!({"threadId": sid, "input": text_input("pwd")}),
-        )
-        .await
-        .unwrap();
+        .run_turn(json!({"threadId": sid, "input": text_input("pwd")}))
+        .await;
     turn["turn"]["items"].to_string()
 }
 

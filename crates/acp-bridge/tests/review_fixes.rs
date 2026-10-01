@@ -31,12 +31,8 @@ async fn forked_thread_is_prompted_without_restore() {
         .await
         .unwrap();
     let fork_id = fork["thread"]["id"].as_str().unwrap().to_string();
-    h.call(
-        "turn/start",
-        json!({"threadId": fork_id, "input": text_input("hi")}),
-    )
-    .await
-    .unwrap();
+    h.run_turn(json!({"threadId": fork_id, "input": text_input("hi")}))
+        .await;
     assert_eq!(
         tail_after_last(&h.methods(), "session/new"),
         vec!["session/new", "session/prompt"]
@@ -79,12 +75,8 @@ async fn load_only_agent_restores_with_session_load_and_drops_replay() {
     let sid = h.start_thread().await;
     h.bridge.recycle_process(&h.conn()).await;
     let turn = h
-        .call(
-            "turn/start",
-            json!({"threadId": sid, "input": text_input("hi")}),
-        )
-        .await
-        .unwrap();
+        .run_turn(json!({"threadId": sid, "input": text_input("hi")}))
+        .await;
     assert_eq!(
         tail_after_last(&h.methods(), "initialize"),
         vec!["initialize", "session/load", "session/prompt"]
@@ -102,17 +94,13 @@ async fn busy_process_is_not_evicted_as_idle() {
     h.initialize().await;
     let sid = h.start_thread().await;
 
-    let bridge = Arc::clone(&h.bridge);
-    let conn = h.conn();
-    let turn = tokio::spawn(async move {
-        bridge
-            .dispatch(
-                &conn,
-                "turn/start",
-                json!({"threadId": sid, "input": text_input("long")}),
-            )
-            .await
-    });
+    let started = h
+        .call(
+            "turn/start",
+            json!({"threadId": sid, "input": text_input("long")}),
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // A second phone connecting spawns a process, which runs eviction.
@@ -127,7 +115,9 @@ async fn busy_process_is_not_evicted_as_idle() {
         .await
         .unwrap();
 
-    turn.await
-        .unwrap()
-        .expect("long turn must survive idle eviction");
+    let turn = h.wait_turn_completed(&started["turn"]["id"]).await;
+    assert_eq!(
+        turn["status"], "completed",
+        "long turn must survive idle eviction: {turn}"
+    );
 }

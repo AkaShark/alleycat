@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alleycat_bridge_core::{JsonRpcError, error_codes};
 use alleycat_codex_proto as p;
 use serde_json::{Value, json};
-use tracing::{info, instrument};
+use tracing::{Instrument, info, instrument};
 
 use crate::acp_client::AcpClient;
 use crate::config_options;
@@ -668,46 +668,55 @@ pub async fn handle_thread_resume(
             data: None,
         })?;
 
-    // ACP spec method is `session/load`, not `session/resume`. The agent
-    // advertises this via `agentCapabilities.loadSession: true`. `mcpServers`
-    // is required by ACP even when empty. `cwd` is also required as a
-    // string; mobile clients often call thread/resume without knowing the
-    // session's original cwd. Devin's serde tolerates `""`, but grok
-    // rejects relative paths with `-32602 Invalid params: Path is not
-    // absolute: `, so fall back to `/` when the client didn't supply one.
-    let cwd_sent = coerce_absolute_cwd(typed.cwd.as_deref()).to_string();
-    let acp_request = json!({
-        "sessionId": typed.thread_id,
-        "cwd": cwd_sent,
-        "mcpServers": [],
-    });
+    // While a turn runs, its process holds the agent until the turn ends, so
+    // `session/load` would wait for the whole turn. The session is loaded
+    // there already: answer from this bridge's turns plus the running one.
+    let running_turn = bridge.running_turn_json(&typed.thread_id);
+    let acp_notifications = if running_turn.is_some() {
+        Vec::new()
+    } else {
+        // ACP spec method is `session/load`, not `session/resume`. The agent
+        // advertises this via `agentCapabilities.loadSession: true`. `mcpServers`
+        // is required by ACP even when empty. `cwd` is also required as a
+        // string; mobile clients often call thread/resume without knowing the
+        // session's original cwd. Devin's serde tolerates `""`, but grok
+        // rejects relative paths with `-32602 Invalid params: Path is not
+        // absolute: `, so fall back to `/` when the client didn't supply one.
+        let cwd_sent = coerce_absolute_cwd(typed.cwd.as_deref()).to_string();
+        let acp_request = json!({
+            "sessionId": typed.thread_id,
+            "cwd": cwd_sent,
+            "mcpServers": [],
+        });
 
-    let acp_response = client
-        .send_request("session/load", acp_request)
-        .await
-        .map_err(|e| JsonRpcError {
-            code: error_codes::INTERNAL_ERROR,
-            // Propagate the agent's own message unchanged — the iOS error
-            // toast shows this verbatim, so prefixes like "Failed to send
-            // ... to ACP agent:" turn a useful sentence ("Session 'X' is
-            // already open in another process") into noise.
-            message: e.to_string(),
-            data: None,
-        })?;
-    client.mark_session_loaded(&typed.thread_id);
-    bridge.set_session_cwd(&typed.thread_id, &cwd_sent);
-    bridge.record_session_config(&typed.thread_id, &acp_response);
+        let acp_response = client
+            .send_request("session/load", acp_request)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: error_codes::INTERNAL_ERROR,
+                // Propagate the agent's own message unchanged — the iOS error
+                // toast shows this verbatim, so prefixes like "Failed to send
+                // ... to ACP agent:" turn a useful sentence ("Session 'X' is
+                // already open in another process") into noise.
+                message: e.to_string(),
+                data: None,
+            })?;
+        client.mark_session_loaded(&typed.thread_id);
+        bridge.set_session_cwd(&typed.thread_id, &cwd_sent);
+        bridge.record_session_config(&typed.thread_id, &acp_response);
 
-    // session/load also streams `available_commands_update` ahead of the
-    // response — cache whatever the agent sends so `skills/list` returns
-    // a real list even before the first turn is sent.
-    let acp_notifications = client.take_pending_notifications().await;
-    if let Some(cmds) = extract_available_commands(&acp_notifications) {
-        bridge.set_available_commands(&typed.thread_id, cmds);
-    }
-    if let Some(mode) = extract_current_mode(&acp_notifications) {
-        bridge.set_current_mode(&typed.thread_id, mode);
-    }
+        // session/load also streams `available_commands_update` ahead of the
+        // response — cache whatever the agent sends so `skills/list` returns
+        // a real list even before the first turn is sent.
+        let acp_notifications = client.take_pending_notifications().await;
+        if let Some(cmds) = extract_available_commands(&acp_notifications) {
+            bridge.set_available_commands(&typed.thread_id, cmds);
+        }
+        if let Some(mode) = extract_current_mode(&acp_notifications) {
+            bridge.set_current_mode(&typed.thread_id, mode);
+        }
+        acp_notifications
+    };
 
     // Local turns (captured by handle_turn_start in this daemon run) take
     // priority if present; otherwise rebuild from the ACP replay stream.
@@ -722,10 +731,19 @@ pub async fn handle_thread_resume(
         rebuilt
     };
 
-    let turns_json: Vec<Value> = stored_turns
+    let mut turns_json: Vec<Value> = stored_turns
         .iter()
         .map(|t| stored_turn_to_json(t))
         .collect();
+    // A turn that just ended is stored before it stops running.
+    let running_turn = running_turn.filter(|turn| !stored_turns.iter().any(|t| turn["id"] == t.id));
+    let status = match running_turn {
+        Some(turn) => {
+            turns_json.push(turn);
+            json!({"type": "active", "activeFlags": []})
+        }
+        None => json!({"type": "idle"}),
+    };
 
     let (created_at_ms, updated_at_ms) = thread_timestamps(&stored_turns);
 
@@ -756,7 +774,7 @@ pub async fn handle_thread_resume(
             "modelProvider": &model_provider,
             "createdAt": created_at_ms,
             "updatedAt": updated_at_ms,
-            "status": { "type": "idle" },
+            "status": status,
             "cwd": &cwd,
             "cliVersion": "",
             "source": "appServer",
@@ -1185,6 +1203,9 @@ pub async fn ensure_session_ready(
 
 /// Handle turn/start request.
 ///
+/// Answers with the `inProgress` turn as soon as the turn is running, like
+/// Codex; steps 2–6 run in the background (`run_prompt`).
+///
 /// Lifecycle:
 ///   1. Emit `turn/started` (status `inProgress`) with a provisional turn id.
 ///   2. Send `session/prompt` to the ACP agent. Notifications stream
@@ -1220,6 +1241,11 @@ pub async fn handle_turn_start(
     })?;
 
     tracing::Span::current().record("thread_id", &typed.thread_id);
+    let this = bridge.this().ok_or_else(|| JsonRpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: "ACP bridge is shutting down".to_string(),
+        data: None,
+    })?;
     let request_cwd = typed
         .cwd
         .as_ref()
@@ -1327,7 +1353,7 @@ pub async fn handle_turn_start(
     // codex item/* notifications on the fly and also accumulates the
     // final item list for StoredTurn.
     let notifier = ctx.notifier().clone();
-    let emitter = std::sync::Arc::new(std::sync::Mutex::new(
+    let emitter = Arc::new(std::sync::Mutex::new(Some(
         crate::streaming::TurnStreamEmitter::new(
             move |method, params| {
                 let _ = notifier.send_notification(method, params.clone());
@@ -1335,41 +1361,103 @@ pub async fn handle_turn_start(
             typed.thread_id.clone(),
             stable_turn_id.clone(),
         ),
-    ));
-    let emitter_cb = std::sync::Arc::clone(&emitter);
+    )));
+    bridge.begin_turn(
+        &typed.thread_id,
+        crate::bridge::ActiveTurn {
+            id: stable_turn_id.clone(),
+            started_at_ms: turn_start_ms,
+            user_item: user_item.clone(),
+            stream: Arc::clone(&emitter),
+        },
+    );
 
+    // Answer now, like Codex: phones wait for this answer before they open
+    // a new task, and read no events while it is pending.
+    tokio::spawn(
+        run_prompt(PromptRun {
+            ctx: ctx.clone(),
+            bridge: this,
+            client: Arc::clone(client),
+            thread_id: typed.thread_id.clone(),
+            turn_id: stable_turn_id.clone(),
+            acp_request,
+            user_item,
+            emitter,
+            turn_start_ms,
+        })
+        .instrument(tracing::Span::current()),
+    );
+
+    Ok(json!({
+        "turn": {
+            "id": stable_turn_id,
+            "items": [],
+            "itemsView": "full",
+            "status": "inProgress",
+            "error": null,
+            "startedAt": turn_start_secs,
+            "completedAt": null,
+            "durationMs": null,
+        },
+    }))
+}
+
+/// A `turn/start` prompt handed to the background.
+struct PromptRun {
+    ctx: alleycat_bridge_core::Conn,
+    bridge: Arc<crate::bridge::AcpBridge>,
+    client: Arc<AcpClient>,
+    thread_id: String,
+    turn_id: String,
+    acp_request: Value,
+    user_item: Value,
+    emitter: Arc<std::sync::Mutex<Option<crate::streaming::TurnStreamEmitter>>>,
+    turn_start_ms: i64,
+}
+
+/// Run a turn's `session/prompt` to the end, then store the turn and emit
+/// `turn/completed`. A prompt error fails the turn.
+async fn run_prompt(run: PromptRun) {
+    let PromptRun {
+        ctx,
+        bridge,
+        client,
+        thread_id,
+        turn_id: stable_turn_id,
+        acp_request,
+        user_item,
+        emitter,
+        turn_start_ms,
+    } = run;
+    let ctx = &ctx;
+    let turn_start_secs = turn_start_ms / 1000;
+
+    let emitter_cb = Arc::clone(&emitter);
     let acp_response = client
         .send_request_streaming("session/prompt", acp_request, move |note| {
-            if let Ok(mut e) = emitter_cb.lock() {
+            let mut e = emitter_cb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(e) = e.as_mut() {
                 e.ingest(&note);
             }
         })
-        .await
-        .map_err(|e| {
-            bridge.emit_thread_warning(
-                ctx,
-                &typed.thread_id,
-                &format!("Failed to send session/prompt to ACP agent: {}", e),
-            );
-            JsonRpcError {
-                code: error_codes::INTERNAL_ERROR,
-                message: format!("Failed to send session/prompt to ACP agent: {}", e),
-                data: None,
-            }
-        })?;
+        .await;
 
     // Discard any notifications still in the fallback buffer — the
     // streaming subscriber already processed them.
     let _ = client.take_pending_notifications().await;
 
-    let stream = std::sync::Arc::try_unwrap(emitter)
-        .ok()
-        .expect("emitter Arc has one strong ref after streaming")
-        .into_inner()
-        .expect("emitter mutex not poisoned")
+    // A panic while ingesting must not leave the turn running forever.
+    let stream = emitter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("only the prompt finishes the emitter")
         .finish();
     tracing::info!(
-        thread_id = %typed.thread_id,
+        thread_id = %thread_id,
         item_count = stream.items.len(),
         "consumed live ACP stream"
     );
@@ -1383,38 +1471,51 @@ pub async fn handle_turn_start(
 
     // Map ACP `stopReason` to codex `TurnStatus`. ACP values:
     // end_turn | max_tokens | max_turn_requests | refusal | cancelled.
-    let stop_reason = acp_response
-        .get("stopReason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("end_turn");
-    let (turn_status, turn_error) = match stop_reason {
-        "refusal" => (
-            "failed",
-            Some(json!({
-                "type": "agentRefused",
-                "message": "Agent refused to complete the turn",
-            })),
-        ),
-        "cancelled" => (
-            "failed",
-            Some(json!({
-                "type": "cancelled",
-                "message": "Turn was cancelled",
-            })),
-        ),
-        "max_tokens" | "max_turn_requests" => {
+    let (stop_reason, turn_status, turn_error) = match &acp_response {
+        Err(e) => {
             bridge.emit_thread_warning(
                 ctx,
-                &typed.thread_id,
-                &format!("Turn ended due to {stop_reason}"),
+                &thread_id,
+                &format!("Failed to send session/prompt to ACP agent: {}", e),
             );
-            ("completed", None)
+            ("error", "failed", Some(json!({"message": e.to_string()})))
         }
-        _ => ("completed", None),
+        Ok(acp_response) => {
+            let stop_reason = acp_response
+                .get("stopReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("end_turn");
+            let (turn_status, turn_error) = match stop_reason {
+                "refusal" => (
+                    "failed",
+                    Some(json!({
+                        "type": "agentRefused",
+                        "message": "Agent refused to complete the turn",
+                    })),
+                ),
+                "cancelled" => (
+                    "failed",
+                    Some(json!({
+                        "type": "cancelled",
+                        "message": "Turn was cancelled",
+                    })),
+                ),
+                "max_tokens" | "max_turn_requests" => {
+                    bridge.emit_thread_warning(
+                        ctx,
+                        &thread_id,
+                        &format!("Turn ended due to {stop_reason}"),
+                    );
+                    ("completed", None)
+                }
+                _ => ("completed", None),
+            };
+            (stop_reason, turn_status, turn_error)
+        }
     };
 
     tracing::info!(
-        thread_id = %typed.thread_id,
+        thread_id = %thread_id,
         item_count = canonical_items.len(),
         stop_reason,
         turn_status,
@@ -1424,13 +1525,13 @@ pub async fn handle_turn_start(
     // Cache the agent's most-recent slash-command list so iOS's
     // `skills/list` returns something useful instead of [].
     if let Some(cmds) = stream.available_commands.clone() {
-        bridge.set_available_commands(&typed.thread_id, cmds);
+        bridge.set_available_commands(&thread_id, cmds);
     }
     // Mode the agent switched into mid-turn (if any) — codex has no
     // dedicated notification but the up-to-date snapshot will surface
     // on the next `collaborationMode/list` call.
     if let Some(mode) = stream.current_mode.clone() {
-        bridge.set_current_mode(&typed.thread_id, mode);
+        bridge.set_current_mode(&thread_id, mode);
     }
 
     // If the agent emitted a plan, surface it as turn/plan/updated.
@@ -1457,7 +1558,7 @@ pub async fn handle_turn_start(
             let _ = ctx.notifier().send_notification(
                 "turn/plan/updated",
                 json!({
-                    "threadId": typed.thread_id,
+                    "threadId": thread_id,
                     "turnId": stable_turn_id,
                     "explanation": null,
                     "plan": plan,
@@ -1480,20 +1581,11 @@ pub async fn handle_turn_start(
         "completedAt": turn_end_secs,
         "durationMs": duration_ms,
     });
-    if ctx.should_emit("turn/completed") {
-        let _ = ctx.notifier().send_notification(
-            "turn/completed",
-            json!({
-                "threadId": typed.thread_id,
-                "turn": completed_turn.clone(),
-            }),
-        );
-    }
-    bridge.set_session_status(ctx, &typed.thread_id, crate::bridge::SessionStatus::Idle);
-
     // Persist the turn so thread/read returns the same items+ids on refresh.
+    // Store it before it stops being the running turn, so a concurrent
+    // `thread/resume` always sees it.
     bridge.append_turn(
-        &typed.thread_id,
+        &thread_id,
         crate::bridge::StoredTurn {
             id: stable_turn_id.clone(),
             items: canonical_items.clone(),
@@ -1503,10 +1595,21 @@ pub async fn handle_turn_start(
             error: turn_error.clone(),
         },
     );
+    bridge.end_turn(&thread_id, &stable_turn_id);
 
-    Ok(json!({
-        "turn": completed_turn,
-    }))
+    if ctx.should_emit("turn/completed") {
+        let _ = ctx.notifier().send_notification(
+            "turn/completed",
+            json!({
+                "threadId": thread_id,
+                "turn": completed_turn,
+            }),
+        );
+    }
+    // A second turn/start on this thread may still be running.
+    if !bridge.has_active_turn(&thread_id) {
+        bridge.set_session_status(ctx, &thread_id, crate::bridge::SessionStatus::Idle);
+    }
 }
 
 /// Handle command/exec request.

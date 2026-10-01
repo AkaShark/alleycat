@@ -33,12 +33,10 @@ async fn turn_start_switches_model_and_effort_before_prompting() {
     let h = Harness::new(json!({})).await;
     h.initialize().await;
     let sid = h.start_thread().await;
-    h.call(
-        "turn/start",
+    h.run_turn(
         json!({"threadId": sid, "input": text_input("hi"), "model": "fake/beta", "effort": "high"}),
     )
-    .await
-    .unwrap();
+    .await;
     let frames = h.frames();
     let tail: Vec<_> = frames.iter().rev().take(3).rev().collect();
     assert_eq!(tail[0]["method"], "session/set_config_option");
@@ -54,12 +52,10 @@ async fn unchanged_values_send_nothing() {
     let h = Harness::new(json!({})).await;
     h.initialize().await;
     let sid = h.start_thread().await;
-    h.call(
-        "turn/start",
+    h.run_turn(
         json!({"threadId": sid, "input": text_input("hi"), "model": "fake/alpha", "effort": "low"}),
     )
-    .await
-    .unwrap();
+    .await;
     assert!(!h.methods().iter().any(|m| m == "session/set_config_option"));
 }
 
@@ -68,12 +64,10 @@ async fn unknown_model_is_skipped_and_max_effort_maps_to_xhigh() {
     let h = Harness::new(json!({})).await;
     h.initialize().await;
     let sid = h.start_thread().await;
-    h.call(
-        "turn/start",
+    h.run_turn(
         json!({"threadId": sid, "input": text_input("hi"), "model": "fake", "effort": "max"}),
     )
-    .await
-    .unwrap();
+    .await;
     let sets: Vec<_> = h
         .frames()
         .into_iter()
