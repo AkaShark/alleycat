@@ -185,6 +185,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
@@ -1971,9 +1972,11 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "socket2",
+ "system-configuration",
  "tokio",
  "tower-service",
  "tracing",
+ "windows-registry",
 ]
 
 [[package]]

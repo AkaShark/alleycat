@@ -27,7 +27,7 @@ name = "alleycat_hermes_bridge"
 path = "src/lib.rs"
 
 [dependencies]
-alleycat-bridge-core = { workspace = true }
+alleycat-bridge-core = { workspace = true, features = ["http-client"] }
 alleycat-codex-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

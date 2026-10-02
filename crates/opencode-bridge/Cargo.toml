@@ -27,7 +27,7 @@ name = "alleycat_opencode_bridge"
 path = "src/lib.rs"
 
 [dependencies]
-alleycat-bridge-core = { workspace = true }
+alleycat-bridge-core = { workspace = true, features = ["http-client"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }

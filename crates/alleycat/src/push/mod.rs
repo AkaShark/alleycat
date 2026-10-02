@@ -12,6 +12,7 @@
 pub mod bridge;
 pub mod client;
 pub mod codex;
+mod http;
 pub mod signing;
 pub mod store;
 
@@ -305,7 +306,7 @@ struct PushCore {
     policy: OutboxPolicy,
     state: Mutex<PushState>,
     wake: Notify,
-    http: reqwest::Client,
+    http: http::PushHttpClient,
     codex: Option<CodexWatcherHandle>,
     runtime: std::sync::Mutex<RuntimeStatus>,
 }
@@ -355,24 +356,6 @@ impl PushService {
             handle
         });
 
-        // Never follow redirects: the signature covers the original origin
-        // and path, and the headers must not leak to another host.
-        let http = reqwest::Client::builder()
-            .user_agent(format!(
-                "{}/{} push",
-                crate::binary_name(),
-                crate::binary_version()
-            ))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|error| {
-                warn!("building push HTTP client failed ({error}); using defaults without a user agent");
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap_or_default()
-            });
-
         let host_id = secret_key.public().to_string();
         let core = Arc::new(PushCore {
             config,
@@ -386,7 +369,7 @@ impl PushService {
                 in_flight: None,
             }),
             wake: Notify::new(),
-            http,
+            http: http::PushHttpClient::default(),
             codex: codex_handle,
             runtime: std::sync::Mutex::new(RuntimeStatus::default()),
         });
@@ -1100,16 +1083,16 @@ impl PushCore {
                         };
                     }
                 };
-                client::send(
-                    &self.http,
-                    &self.secret_key,
-                    target,
-                    Method::POST,
-                    "/v2/subscriptions",
-                    Some(body),
-                    now,
-                )
-                .await
+                self.http
+                    .send(
+                        &self.secret_key,
+                        target,
+                        Method::POST,
+                        "/v2/subscriptions",
+                        Some(body),
+                        now,
+                    )
+                    .await
             }
             Job::Event { body, .. } => {
                 let body = match serde_json::to_vec(body) {
@@ -1121,16 +1104,16 @@ impl PushCore {
                         };
                     }
                 };
-                client::send(
-                    &self.http,
-                    &self.secret_key,
-                    target,
-                    Method::POST,
-                    "/v2/events",
-                    Some(body),
-                    now,
-                )
-                .await
+                self.http
+                    .send(
+                        &self.secret_key,
+                        target,
+                        Method::POST,
+                        "/v2/events",
+                        Some(body),
+                        now,
+                    )
+                    .await
             }
             Job::Revoke { remote_id, .. } => {
                 if !is_safe_remote_id(remote_id) {
@@ -1139,16 +1122,16 @@ impl PushCore {
                         error: "refusing to revoke a malformed subscription id".into(),
                     };
                 }
-                client::send(
-                    &self.http,
-                    &self.secret_key,
-                    target,
-                    Method::DELETE,
-                    &format!("/v2/subscriptions/{remote_id}"),
-                    None,
-                    now,
-                )
-                .await
+                self.http
+                    .send(
+                        &self.secret_key,
+                        target,
+                        Method::DELETE,
+                        &format!("/v2/subscriptions/{remote_id}"),
+                        None,
+                        now,
+                    )
+                    .await
             }
         }
     }

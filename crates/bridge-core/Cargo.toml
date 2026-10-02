@@ -13,6 +13,9 @@ description = "Shared JSON-RPC framing, server scaffolding, and notification plu
 name = "alleycat_bridge_core"
 path = "src/lib.rs"
 
+[features]
+http-client = ["dep:reqwest"]
+
 [dependencies]
 alleycat-codex-proto = { workspace = true }
 anyhow = { workspace = true }
@@ -21,6 +24,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = "6"
 futures = { workspace = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

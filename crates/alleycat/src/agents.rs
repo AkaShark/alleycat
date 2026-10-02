@@ -1074,8 +1074,11 @@ impl AgentManager {
 
 async fn hermes_api_available(api_base: &str) -> bool {
     let url = format!("{}/health", api_base.trim_end_matches('/'));
+    let Ok(client) = alleycat_bridge_core::http_client::builder_for(api_base).build() else {
+        return false;
+    };
     matches!(
-        tokio::time::timeout(Duration::from_millis(300), reqwest::get(url)).await,
+        tokio::time::timeout(Duration::from_millis(300), client.get(url).send()).await,
         Ok(Ok(response)) if response.status().is_success()
     )
 }

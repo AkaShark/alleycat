@@ -99,7 +99,7 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// `timeout` elapses. Replaces the previous fixed 300ms sleep with a
 /// race-free readiness gate.
 async fn wait_until_healthy(base_url: &str, timeout: Duration) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    let client = alleycat_bridge_core::http_client::builder_for(base_url).build()?;
     let url = format!("{}/global/health", base_url.trim_end_matches('/'));
     let deadline = Instant::now() + timeout;
     loop {

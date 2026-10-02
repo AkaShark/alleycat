@@ -97,7 +97,7 @@ pub struct HermesApiClient {
 
 impl HermesApiClient {
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
-        let client = Client::builder()
+        let client = alleycat_bridge_core::http_client::builder_for(base_url)
             .timeout(Duration::from_secs(300))
             .build()
             .expect("reqwest client should build");

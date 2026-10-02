@@ -2,6 +2,8 @@ pub mod codex_resolver;
 pub mod envelope;
 pub mod framing;
 pub mod git_info;
+#[cfg(feature = "http-client")]
+pub mod http_client;
 pub mod launch_environment;
 pub mod launcher;
 pub mod notify;

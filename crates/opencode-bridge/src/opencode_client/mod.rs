@@ -11,7 +11,9 @@ pub struct OpencodeClient {
 impl OpencodeClient {
     pub fn new(base_url: String, auth_token: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: alleycat_bridge_core::http_client::builder_for(&base_url)
+                .build()
+                .expect("OpenCode HTTP client should build"),
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token,
         }
