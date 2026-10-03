@@ -1628,7 +1628,7 @@ fn validate_subscribe(
     check_id("thread_id", &request.thread_id)?;
     check_id("turn_id", &request.turn_id)?;
     let platform = Platform::parse(&request.target.platform)
-        .ok_or_else(|| PushError::bad_request("target.platform must be `ios` or `android`"))?;
+        .ok_or_else(|| PushError::bad_request("target.platform must be `ios`, `android` or `harmony`"))?;
     let environment = match (platform, request.target.apns_environment.as_deref()) {
         (Platform::Ios, Some(raw)) => Some(ApnsEnvironment::parse(raw).ok_or_else(|| {
             PushError::bad_request("target.apns_environment must be `sandbox` or `production`")
@@ -1638,8 +1638,8 @@ fn validate_subscribe(
                 "target.apns_environment is required for ios",
             ));
         }
-        (Platform::Android, None | Some("none")) => None,
-        (Platform::Android, Some(_)) => {
+        (Platform::Android | Platform::Harmony, None | Some("none")) => None,
+        (Platform::Android | Platform::Harmony, Some(_)) => {
             return Err(PushError::bad_request(
                 "target.apns_environment is only valid for ios",
             ));

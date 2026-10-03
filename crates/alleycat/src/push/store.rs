@@ -18,6 +18,7 @@ use crate::fsutil::atomic_write;
 pub enum Platform {
     Ios,
     Android,
+    Harmony,
 }
 
 impl Platform {
@@ -25,6 +26,7 @@ impl Platform {
         match value {
             "ios" => Some(Self::Ios),
             "android" => Some(Self::Android),
+            "harmony" => Some(Self::Harmony),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl Platform {
         match self {
             Self::Ios => "ios",
             Self::Android => "android",
+            Self::Harmony => "harmony",
         }
     }
 }

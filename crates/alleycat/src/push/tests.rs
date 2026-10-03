@@ -1329,32 +1329,28 @@ async fn subscribe_validates_grant_and_fields() {
         .unwrap();
     h.wait_state("cleared", |d| d.subscriptions.is_empty())
         .await;
-    let registers_before = worker.count("POST", "/v2/subscriptions");
-
-    // Android: no environment.
-    let ok = subscribe(
-        &h,
-        &phone,
-        GrantSpec {
-            platform: "android",
-            environment: None,
-            sealed: "AQG-android_sealed-target",
-            ..GrantSpec::ios("claude", "th", "tu")
-        },
-    )
-    .await;
-    assert!(ok.is_ok(), "{ok:?}");
-    wait_until("android register", || {
-        worker.count("POST", "/v2/subscriptions") > registers_before
-    })
-    .await;
-    let register = worker
-        .requests()
-        .into_iter()
-        .rfind(|r| r.path == "/v2/subscriptions")
-        .unwrap();
-    assert_eq!(register.body["platform"], "android");
-    assert!(register.body.get("apnsEnvironment").is_none());
+    // Both non-APNs platforms preserve their identity through a signed grant.
+    for platform in ["android", "harmony"] {
+        let registers_before = worker.count("POST", "/v2/subscriptions");
+        let ok = subscribe(
+            &h,
+            &phone,
+            GrantSpec {
+                platform,
+                environment: None,
+                sealed: "AQG-mobile_sealed-target",
+                ..GrantSpec::ios("claude", "th", platform)
+            },
+        ).await;
+        assert!(ok.is_ok(), "{platform}: {ok:?}");
+        wait_until("mobile register", || {
+            worker.count("POST", "/v2/subscriptions") > registers_before
+        }).await;
+        let register = worker.requests().into_iter()
+            .rfind(|r| r.path == "/v2/subscriptions").unwrap();
+        assert_eq!(register.body["platform"], platform);
+        assert!(register.body.get("apnsEnvironment").is_none());
+    }
 }
 
 #[test]
